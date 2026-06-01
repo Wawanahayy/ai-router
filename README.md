@@ -225,6 +225,107 @@ Common settings:
 Do not commit `.env`, database files, API key files, logs, local virtualenvs, or generated reports.
 Change the default password before exposing the dashboard publicly.
 
+## Optional: Keep It Running With Cloudflare Tunnel
+
+AI Router works locally without Cloudflare. Cloudflare Tunnel is optional and is
+only needed if you want to open the dashboard/API from another device, another
+network, or a temporary public URL without opening a server port.
+
+Before installing Cloudflare Tunnel, decide whether you actually need remote
+access. If you only use AI Router on the same machine, skip this section.
+
+Install `cloudflared` first, then run AI Router and Cloudflare Tunnel as
+services.
+
+Install `cloudflared` from the official Cloudflare downloads page:
+
+```text
+https://developers.cloudflare.com/tunnel/downloads/
+```
+
+For a temporary `trycloudflare.com` URL:
+
+```bash
+cloudflared tunnel --url http://localhost:32128
+```
+
+That URL is temporary. If `cloudflared` stops or the server restarts, the URL
+can change when the tunnel starts again.
+
+To keep AI Router running on Linux with systemd, create:
+
+```bash
+sudo nano /etc/systemd/system/ai-router.service
+```
+
+Example service file:
+
+```ini
+[Unit]
+Description=AI Router
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ai-router
+ExecStart=/root/ai-router/.venv/bin/python /root/ai-router/run.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/ai-router/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-router
+sudo systemctl status ai-router
+```
+
+To keep the temporary Cloudflare Tunnel running too, create:
+
+```bash
+sudo nano /etc/systemd/system/ai-router-cloudflare.service
+```
+
+Example service file:
+
+```ini
+[Unit]
+Description=AI Router Cloudflare Temporary Tunnel
+After=network.target ai-router.service
+Requires=ai-router.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:32128
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-router-cloudflare
+sudo systemctl status ai-router-cloudflare
+```
+
+View the generated Cloudflare URL:
+
+```bash
+journalctl -u ai-router-cloudflare -f
+```
+
+If you expose the dashboard through Cloudflare, set `AI_ROUTER_AUTH=true` and
+change `AI_ROUTER_PASSWORD` before starting the service.
+
 ## Security Notes
 
 - Treat upstream provider keys as secrets.

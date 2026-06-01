@@ -77,6 +77,22 @@ Run dashboard development mode:
 bash start.sh dev-web
 ```
 
+## Deployment Notes
+
+The default production/local endpoint is `http://localhost:32128`.
+
+For Cloudflare Tunnel deployment:
+
+- Cloudflare Tunnel is optional. Do not suggest it as required for normal local use.
+- Ask the user before installing or configuring Cloudflare Tunnel.
+- Explain the purpose clearly: it exposes the dashboard/API so it can be opened from another device, another network, or a temporary public URL.
+- `cloudflared` must be installed separately before tunnel commands work.
+- Link users to the official downloads page: `https://developers.cloudflare.com/tunnel/downloads/`.
+- Temporary tunnels use `cloudflared tunnel --url http://localhost:32128`.
+- Temporary `trycloudflare.com` URLs can change after `cloudflared` restarts.
+- For always-on Linux usage, document two systemd services: one for AI Router and one for `cloudflared`.
+- If the dashboard is exposed, require `AI_ROUTER_AUTH=true` and a changed `AI_ROUTER_PASSWORD`.
+
 ## Validation Checklist
 
 Before finishing backend changes:
