@@ -277,12 +277,21 @@ EnvironmentFile=/root/ai-router/.env
 WantedBy=multi-user.target
 ```
 
-Enable it:
+Manage the AI Router service:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now ai-router
+sudo systemctl start ai-router
+sudo systemctl stop ai-router
+sudo systemctl restart ai-router
 sudo systemctl status ai-router
+```
+
+Live logs:
+
+```bash
+journalctl -u ai-router -n 50 -f
 ```
 
 To keep the temporary Cloudflare Tunnel running too, create:
@@ -309,18 +318,21 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Enable it:
+Manage the Cloudflare Tunnel service:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now ai-router-cloudflare
+sudo systemctl start ai-router-cloudflare
+sudo systemctl stop ai-router-cloudflare
+sudo systemctl restart ai-router-cloudflare
 sudo systemctl status ai-router-cloudflare
 ```
 
-View the generated Cloudflare URL:
+View live logs and the generated Cloudflare URL:
 
 ```bash
-journalctl -u ai-router-cloudflare -f
+journalctl -u ai-router-cloudflare -n 50 -f
 ```
 
 If you expose the dashboard through Cloudflare, set `AI_ROUTER_AUTH=true` and
