@@ -12,7 +12,7 @@ usage() {
 AI Router helper script
 
 Usage:
-  bash start.sh setup       Create Python venv, install backend deps, create .env
+  bash start.sh setup       Create Python venv, install backend deps, create .env, install Claude Code CLI when possible
   bash start.sh run         Run the backend server
   bash start.sh build-web   Install dashboard deps and build static files
   bash start.sh dev-web     Run dashboard dev server
@@ -59,6 +59,25 @@ cmd_setup() {
 
   "${py}" -m pip install --upgrade pip
   "${py}" -m pip install -r requirements.txt
+
+  if command -v claude >/dev/null 2>&1; then
+    echo "Claude Code CLI already installed: $(command -v claude)"
+  elif command -v npm >/dev/null 2>&1; then
+    echo "Installing Claude Code CLI..."
+    if npm install -g @anthropic-ai/claude-code; then
+      if command -v claude >/dev/null 2>&1; then
+        echo "Claude Code CLI installed: $(command -v claude)"
+      else
+        echo "Claude Code CLI package installed, but 'claude' is not on PATH yet." >&2
+      fi
+    else
+      echo "Claude Code CLI install failed. You can retry manually:" >&2
+      echo "  npm install -g @anthropic-ai/claude-code" >&2
+    fi
+  else
+    echo "npm not found; skipping Claude Code CLI install." >&2
+    echo "Install Node.js/npm, then run: npm install -g @anthropic-ai/claude-code" >&2
+  fi
 
   if [ ! -f ".env" ]; then
     cp .env.example .env

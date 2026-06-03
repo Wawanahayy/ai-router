@@ -11,7 +11,7 @@ from . import db, rtk
 from .services.models import fetch_upstream_models, invalidate_models_cache, proxy_models
 from .services.provider_tests import test_provider, test_provider_tools
 from .services.streaming import STREAM_CONNECT_TIMEOUT, STREAM_STALL_TIMEOUT, proxy_stream
-from .services.upstream import build_request, provider_format
+from .services.upstream import build_request, parse_extra_headers, provider_format
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ UPSTREAM_CONNECT_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_CONNECT_TIMEOUT",
 UPSTREAM_READ_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_READ_TIMEOUT", "300"))
 UPSTREAM_WRITE_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_WRITE_TIMEOUT", "20"))
 UPSTREAM_POOL_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_POOL_TIMEOUT", "20"))
+CLAUDE_CLI_TIMEOUT = float(os.getenv("AI_ROUTER_CLAUDE_CLI_TIMEOUT", "300"))
 
 
 def _upstream_timeout():
@@ -106,7 +107,7 @@ async def resolve_model(model: str):
     3. Check if alias exists but deactivated -> return None (explicit reject)
     4. Prefix match (only if provider prefix_enabled=1): "prefix/model" -> find provider + active alias
     5. Direct model name -> round-robin across providers that have this model active
-    6. Fallback: round-robin across active providers with alive keys
+    6. Empty model only: round-robin across active providers with alive keys
     """
     if not model or not model.strip():
         return await _auto_pick_rr()
@@ -130,7 +131,7 @@ async def resolve_model(model: str):
         prefix, _ = lookup_model.split("/", 1)
         _, actual_model = requested_model.split("/", 1)
         providers = await db.list_providers()
-        matching = [p for p in providers if p["prefix"] == prefix and p["is_active"] and p.get("prefix_enabled", 0)]
+        matching = [p for p in providers if (p.get("prefix") or "").lower() == prefix and p["is_active"] and p.get("prefix_enabled", 0)]
         if matching:
             for p in matching:
                 for a in p.get("aliases", []):
@@ -147,6 +148,7 @@ async def resolve_model(model: str):
                 picked = available[rr % len(available)]
                 await db._set_rr(f"prefix_rr_{prefix}", (rr + 1) % len(available))
                 return picked["id"], actual_model
+            return None, requested_model
     
     providers = await db.list_providers()
     matching = []
@@ -164,7 +166,7 @@ async def resolve_model(model: str):
         await db._set_rr(f"model_rr_{lookup_model}", (rr + 1) % len(matching))
         return picked["id"], actual_model
     
-    return await _auto_pick_rr()
+    return None, requested_model
 
 
 async def _auto_pick_rr():
@@ -275,6 +277,11 @@ def _chain_item(provider, key, model, status_code, error_msg, latency_ms):
 
 def _provider_unsupported_reason(provider: dict, request_body: dict):
     has_tools = any(k in request_body for k in ("tools", "tool_choice", "function_call", "functions"))
+    if provider.get("type") == "claude-cli":
+        if has_tools:
+            return f"Provider '{provider['name']}' uses Claude CLI and does not support tool calling yet"
+        if request_body.get("stream"):
+            return f"Provider '{provider['name']}' uses Claude CLI and does not support streaming yet"
     if has_tools and not provider.get("supports_tools", 1):
         return f"Provider '{provider['name']}' does not support tool calling"
     if request_body.get("stream") and not provider.get("supports_streaming", 1):
@@ -310,6 +317,170 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
         request_body["stream_options"] = stream_options
 
     return {"url": url, "headers": headers, "body": request_body}
+
+
+def _claude_cli_env(provider: dict, key: dict, actual_model: str) -> dict:
+    env = os.environ.copy()
+    if provider.get("base_url"):
+        env["ANTHROPIC_BASE_URL"] = provider["base_url"].rstrip("/")
+    if key and key.get("key_value"):
+        env["ANTHROPIC_AUTH_TOKEN"] = key["key_value"]
+        env["ANTHROPIC_API_KEY"] = key["key_value"]
+    if actual_model:
+        env["ANTHROPIC_MODEL"] = actual_model
+
+    for name, value in parse_extra_headers(provider).items():
+        if not isinstance(name, str):
+            continue
+        if name.startswith("CLAUDE_") or name.startswith("ANTHROPIC_") or name.startswith("AI_ROUTER_"):
+            env[name] = str(value)
+    return env
+
+
+def _request_to_cli_prompt(body: dict, native_anthropic: bool = False) -> str:
+    parts = []
+    system = body.get("system")
+    if isinstance(system, list):
+        system = "\n".join(_content_to_text(part.get("text") if isinstance(part, dict) else part) for part in system)
+    if system:
+        parts.append(f"System:\n{_content_to_text(system)}")
+
+    if not native_anthropic:
+        for msg in body.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or "user"
+            if role == "system":
+                text = _content_to_text(msg.get("content"))
+                if text:
+                    parts.append(f"System:\n{text}")
+                continue
+            text = _content_to_text(msg.get("content"))
+            if text:
+                parts.append(f"{role.title()}:\n{text}")
+    else:
+        for msg in body.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            text = _content_to_text(msg.get("content"))
+            if text:
+                parts.append(f"{(msg.get('role') or 'user').title()}:\n{text}")
+
+    json_instruction = _json_mode_instruction(body.get("response_format"))
+    if json_instruction:
+        parts.append(f"System:\n{json_instruction}")
+
+    return "\n\n".join(parts).strip() or "Continue."
+
+
+def _openai_cli_response(text: str, model: str, tokens_in: int, tokens_out: int) -> dict:
+    return {
+        "id": f"chatcmpl-cli-{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": tokens_in,
+            "completion_tokens": tokens_out,
+            "total_tokens": tokens_in + tokens_out,
+        },
+    }
+
+
+def _anthropic_cli_response(text: str, model: str, tokens_in: int, tokens_out: int) -> dict:
+    return {
+        "id": f"msg_cli_{int(time.time() * 1000)}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out},
+    }
+
+
+async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_body: dict, native_anthropic: bool = False):
+    body = copy.deepcopy(request_body)
+    body["model"] = actual_model
+    if not native_anthropic:
+        _normalize_messages(body, provider, actual_model)
+        rtk_enabled = (await db.get_setting("rtk_enabled")) == "true"
+        body, _ = rtk.compress_request_body(body, enabled=rtk_enabled)
+    else:
+        body.setdefault("max_tokens", 4096)
+
+    prompt = _request_to_cli_prompt(body, native_anthropic=native_anthropic)
+    binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
+    command = [binary, "-p", prompt]
+    if actual_model:
+        command.extend(["--model", actual_model])
+
+    start = time.time()
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_claude_cli_env(provider, key, actual_model),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_timeout_value(CLAUDE_CLI_TIMEOUT))
+    except asyncio.TimeoutError:
+        latency = int((time.time() - start) * 1000)
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return None, 504, latency, f"Claude CLI timeout after {CLAUDE_CLI_TIMEOUT:g}s", 0, 0
+    except FileNotFoundError:
+        latency = int((time.time() - start) * 1000)
+        return None, 500, latency, f"Claude CLI binary not found: {binary}", 0, 0
+    except Exception as e:
+        latency = int((time.time() - start) * 1000)
+        return None, 500, latency, str(e)[:500], 0, 0
+
+    latency = int((time.time() - start) * 1000)
+    out = (stdout or b"").decode("utf-8", errors="replace").strip()
+    err = (stderr or b"").decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        return None, 502, latency, (err or out or f"Claude CLI exited with code {proc.returncode}")[:500], 0, 0
+    if not out:
+        return None, 502, latency, (err or "Claude CLI returned empty output")[:500], 0, 0
+
+    tokens_in = _estimate_input_tokens(body)
+    tokens_out = _estimate_output_tokens_from_response(out)
+    if native_anthropic:
+        return _anthropic_cli_response(out, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
+    return _openai_cli_response(out, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
+
+
+async def _proxy_claude_cli_attempt(provider: dict, key: dict, actual_model: str, request_body: dict, local_key_id: str, fallback_chain: list, native_anthropic: bool = False):
+    response_data, status, latency, error_msg, tokens_in, tokens_out = await _run_claude_cli(
+        provider, key, actual_model, request_body, native_anthropic=native_anthropic
+    )
+    if status >= 400:
+        await db.mark_key_error(key["id"], status, error_msg, actual_model)
+        item = _chain_item(provider, key, actual_model, status, error_msg, latency)
+        fallback_chain.append(item)
+        await db.add_log(provider["id"], key["id"], actual_model, 0, 0, latency, status, error_msg, local_key_id, fallback_chain)
+        return response_data, status, error_msg
+
+    total_tokens = tokens_in + tokens_out
+    await db.mark_key_success(key["id"], tokens_in, tokens_out)
+    await db.clear_key_model_lock(key["id"], actual_model)
+    await db.mark_key_used(key["id"])
+    if local_key_id:
+        await db.mark_local_key_used(local_key_id, total_tokens)
+    await db.add_log(provider["id"], key["id"], actual_model, tokens_in, tokens_out, latency, status, local_key_id=local_key_id, fallback_chain=fallback_chain or None)
+    return response_data, status, None
 
 
 def _normalize_messages(body: dict, provider: dict | None = None, model: str = ""):
@@ -415,19 +586,36 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
                 })
                 continue
             provider = await db.get_provider(provider_id)
-            if not provider or provider_format(provider) != "anthropic-compatible":
+            if not provider or (provider_format(provider) != "anthropic-compatible" and provider.get("type") != "claude-cli"):
                 continue
 
-            if request_body.get("stream") and not provider.get("supports_streaming", 1):
-                last_error = f"Provider '{provider['name']}' does not support streaming"
+            unsupported = _provider_unsupported_reason(provider, request_body)
+            if unsupported:
+                last_error = unsupported
                 last_status = 400
-                fallback_chain.append(_chain_item(provider, None, actual_model, 400, last_error, 0))
+                fallback_chain.append(_chain_item(provider, None, actual_model, 400, unsupported, 0))
                 continue
 
             keys = await db.list_alive_keys(provider_id, model=actual_model)
             if not keys:
                 last_error = f"No alive API keys for provider '{provider['name']}'"
                 fallback_chain.append(_chain_item(provider, None, actual_model, 502, last_error, 0))
+                continue
+
+            if provider.get("type") == "claude-cli":
+                for key in keys:
+                    response_data, status, error_msg = await _proxy_claude_cli_attempt(
+                        provider, key, actual_model, request_body, local_key_id, fallback_chain, native_anthropic=True
+                    )
+                    if status < 400:
+                        return response_data, status
+                    last_error = error_msg
+                    last_status = status
+                    if not _fallbackable(status):
+                        break
+                wait_seconds = _transient_wait_seconds(last_status)
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
                 continue
 
             prepared = _prepare_anthropic_native(provider, copy.deepcopy(request_body), actual_model)
@@ -488,6 +676,11 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
                 await asyncio.sleep(wait_seconds)
 
     return {"error": last_error, "fallback_chain": fallback_chain}, last_status
+
+
+async def proxy_anthropic_count_tokens(request_body: dict):
+    """Return an Anthropic-compatible token count estimate for gateway clients."""
+    return {"input_tokens": _estimate_input_tokens(request_body)}, 200
 
 
 async def _proxy_stream_attempt(request_body: dict, provider_id: str, actual_model: str, local_key_id: str = None):
@@ -604,6 +797,22 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                 fallback_chain.append(_chain_item(provider, None, actual_model, 502, msg, 0))
                 last_error = msg
                 last_status = 502
+                continue
+
+            if provider.get("type") == "claude-cli":
+                for key in keys:
+                    response_data, status, error_msg = await _proxy_claude_cli_attempt(
+                        provider, key, actual_model, request_body, local_key_id, fallback_chain
+                    )
+                    if status < 400:
+                        return response_data, status
+                    last_error = error_msg
+                    last_status = status
+                    if not _fallbackable(status):
+                        break
+                wait_seconds = _transient_wait_seconds(last_status)
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
                 continue
 
             prepared = await _prepare_upstream(provider, copy.deepcopy(request_body), actual_model)

@@ -61,6 +61,83 @@ export default function LocalKeys() {
     return key.slice(0, 8) + '...' + key.slice(-4)
   }
 
+  function activeKeyValue() {
+    return keys.find(k => k.is_active !== 0)?.key_value || 'ar-your-key-here'
+  }
+
+  function commandExamples() {
+    const apiKey = activeKeyValue()
+    return [
+      {
+        id: 'openai-chat',
+        title: 'OpenAI-compatible model',
+        body: `curl http://localhost:32128/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "gpt-4",
+    "messages": [
+      {"role": "user", "content": "hi"}
+    ]
+  }'`
+      },
+      {
+        id: 'anthropic-messages',
+        title: 'Anthropic-compatible model',
+        body: `curl http://localhost:32128/v1/messages \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "claude-3-haiku-20240307",
+    "max_tokens": 256,
+    "messages": [
+      {"role": "user", "content": "hi"}
+    ]
+  }'`
+      },
+      {
+        id: 'combo-chat',
+        title: 'Combo route',
+        body: `curl http://localhost:32128/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "your-combo-name",
+    "messages": [
+      {"role": "user", "content": "hi"}
+    ]
+  }'`
+      },
+      {
+        id: 'prefix-chat',
+        title: 'Provider prefix model',
+        body: `curl http://localhost:32128/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "provider-prefix/model-id",
+    "messages": [
+      {"role": "user", "content": "hi"}
+    ]
+  }'`
+      },
+      {
+        id: 'claude-cli-chat',
+        title: 'Claude CLI provider model',
+        body: `curl http://localhost:32128/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [
+      {"role": "user", "content": "halo, jawab singkat"}
+    ]
+  }'`
+      }
+    ]
+  }
+
   if (loading) return <div className="text-slate-500">Loading...</div>
 
   return (
@@ -169,22 +246,22 @@ export default function LocalKeys() {
         <div className="text-xs text-slate-400 space-y-1">
           <p><span className="text-slate-500">OpenAI endpoint:</span> <code className="text-emerald-400 font-mono">http://your-server:32128/v1/chat/completions</code></p>
           <p><span className="text-slate-500">Anthropic endpoint:</span> <code className="text-emerald-400 font-mono">http://your-server:32128/v1/messages</code></p>
-          <p><span className="text-slate-500">Auth:</span> <code className="text-emerald-400 font-mono">Authorization: Bearer ar-your-key-here</code></p>
-          <p><span className="text-slate-500">Format:</span> OpenAI-compatible and Anthropic Messages compatible</p>
+          <p><span className="text-slate-500">Auth:</span> <code className="text-emerald-400 font-mono">Authorization: Bearer {activeKeyValue()}</code></p>
+          <p><span className="text-slate-500">Model:</span> use a provider model, alias, combo name, or Claude CLI model that exists in AI Router.</p>
         </div>
-        <pre className="bg-black/30 rounded p-3 text-xs text-slate-400 overflow-x-auto font-mono">
-{`curl http://localhost:32128/v1/chat/completions \\
-  -H "Authorization: Bearer ar-your-key-here" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'`}
-        </pre>
-        <pre className="bg-black/30 rounded p-3 text-xs text-slate-400 overflow-x-auto font-mono">
-{`curl http://localhost:32128/v1/messages \\
-  -H "Authorization: Bearer ar-your-key-here" \\
-  -H "Content-Type: application/json" \\
-  -H "anthropic-version: 2023-06-01" \\
-  -d '{"model":"claude-3-haiku-20240307","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'`}
-        </pre>
+        <div className="grid gap-3">
+          {commandExamples().map(example => (
+            <div key={example.id} className="rounded border border-[#1e1e2e] bg-black/20 overflow-hidden">
+              <div className="flex items-center justify-between gap-3 border-b border-[#1e1e2e] px-3 py-2">
+                <span className="text-xs font-medium text-slate-300">{example.title}</span>
+                <button onClick={() => copyKey(example.body, example.id)} className="btn-ghost text-xs flex items-center gap-1">
+                  <Copy size={12} /> {copied === example.id ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <pre className="p-3 text-xs text-slate-400 overflow-x-auto font-mono whitespace-pre">{example.body}</pre>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )

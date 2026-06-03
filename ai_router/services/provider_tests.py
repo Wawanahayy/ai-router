@@ -1,6 +1,8 @@
 """Provider connectivity and agent-tool tests."""
 import json
 import logging
+import os
+import shutil
 import time
 
 import httpx
@@ -37,6 +39,14 @@ async def test_provider(provider_id: str):
     start = time.time()
 
     try:
+        if provider.get("type") == "claude-cli":
+            binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
+            path = shutil.which(binary)
+            latency = int((time.time() - start) * 1000)
+            if not path:
+                return {"valid": False, "latency_ms": latency, "error": f"Claude CLI binary not found: {binary}"}
+            return {"valid": True, "latency_ms": latency, "status": "cli-found", "binary": path}
+
         if provider_format(provider) == "anthropic-compatible":
             req = build_request(provider, "chat", key["key_value"])
             body = {"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
