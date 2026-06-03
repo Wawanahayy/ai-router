@@ -128,7 +128,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('rr_counter', '0');
 PROVIDER_PRESETS = [
     {"name": "Custom OpenAI Compatible", "type": "openai-compatible", "base_url": "https://example.com/v1", "prefix": "custom", "prefix_enabled": 0, "auth_type": "bearer", "chat_path": "/chat/completions", "models_path": "/models"},
     {"name": "Custom Claude / Anthropic Compatible", "type": "anthropic-compatible", "base_url": "https://example.com/v1", "prefix": "custom-claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "anthropic_version": "2023-06-01"},
-    {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "models_path": "", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 0, "supports_json_mode": 1, "anthropic_version": "2023-06-01"},
+    {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "models_path": "", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 1, "supports_json_mode": 1, "anthropic_version": "2023-06-01"},
     {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 0},
     {"name": "Anthropic (Claude)", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages"},
     {"name": "NVIDIA NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 0},
@@ -194,7 +194,7 @@ async def get_db() -> aiosqlite.Connection:
                 "UPDATE settings SET value=? WHERE key='login_password' AND (value IS NULL OR value='')",
                 (config.AUTH_PASSWORD,),
             )
-        await _db.execute("UPDATE providers SET supports_tools=1, supports_streaming=0 WHERE type='claude-cli'")
+        await _db.execute("UPDATE providers SET supports_tools=1, supports_streaming=1 WHERE type='claude-cli'")
         await _db.commit()
     return _db
 
@@ -238,7 +238,7 @@ def _normalize_provider_data(data: dict, existing: dict | None = None) -> dict:
     merged["supports_json_mode"] = int(merged.get("supports_json_mode", 1))
     if provider_type == "claude-cli":
         merged["supports_tools"] = 1
-        merged["supports_streaming"] = 0
+        merged["supports_streaming"] = 1
     merged["anthropic_version"] = merged.get("anthropic_version") or "2023-06-01"
     extra_headers = merged.get("extra_headers") or {}
     if isinstance(extra_headers, str):
