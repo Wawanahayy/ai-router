@@ -278,10 +278,9 @@ def _chain_item(provider, key, model, status_code, error_msg, latency_ms):
 def _provider_unsupported_reason(provider: dict, request_body: dict):
     has_tools = any(k in request_body for k in ("tools", "tool_choice", "function_call", "functions"))
     if provider.get("type") == "claude-cli":
-        if has_tools:
-            return f"Provider '{provider['name']}' uses Claude CLI and does not support tool calling yet"
         if request_body.get("stream"):
             return f"Provider '{provider['name']}' uses Claude CLI and does not support streaming yet"
+        return None
     if has_tools and not provider.get("supports_tools", 1):
         return f"Provider '{provider['name']}' does not support tool calling"
     if request_body.get("stream") and not provider.get("supports_streaming", 1):
@@ -321,6 +320,7 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
 
 def _claude_cli_env(provider: dict, key: dict, actual_model: str) -> dict:
     env = os.environ.copy()
+    env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     if provider.get("base_url"):
         env["ANTHROPIC_BASE_URL"] = provider["base_url"].rstrip("/")
     if key and key.get("key_value"):
@@ -335,6 +335,42 @@ def _claude_cli_env(provider: dict, key: dict, actual_model: str) -> dict:
         if name.startswith("CLAUDE_") or name.startswith("ANTHROPIC_") or name.startswith("AI_ROUTER_"):
             env[name] = str(value)
     return env
+
+
+def _cli_tool_definitions(body: dict) -> list[dict]:
+    tools = body.get("tools") or body.get("functions") or []
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") or tool
+        name = function.get("name")
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "description": function.get("description") or "",
+            "parameters": function.get("parameters") or function.get("input_schema") or {},
+        })
+    return result
+
+
+def _cli_tool_instruction(body: dict) -> str | None:
+    tools = _cli_tool_definitions(body)
+    if not tools:
+        return None
+
+    choice = body.get("tool_choice") or body.get("function_call") or "auto"
+    return (
+        "You may call exactly one tool if needed.\n"
+        "Available tools:\n"
+        f"{json.dumps(tools, ensure_ascii=False)}\n\n"
+        f"Tool choice: {json.dumps(choice, ensure_ascii=False)}\n\n"
+        "If you need a tool, respond only with valid JSON in this exact shape:\n"
+        '{"tool_call":{"name":"tool_name","arguments":{}}}\n'
+        "If you do not need a tool, respond normally as plain text.\n"
+        "Do not wrap JSON in markdown fences."
+    )
 
 
 def _request_to_cli_prompt(body: dict, native_anthropic: bool = False) -> str:
@@ -370,10 +406,58 @@ def _request_to_cli_prompt(body: dict, native_anthropic: bool = False) -> str:
     if json_instruction:
         parts.append(f"System:\n{json_instruction}")
 
+    tool_instruction = _cli_tool_instruction(body)
+    if tool_instruction:
+        parts.append(f"System:\n{tool_instruction}")
+
     return "\n\n".join(parts).strip() or "Continue."
 
 
-def _openai_cli_response(text: str, model: str, tokens_in: int, tokens_out: int) -> dict:
+def _extract_cli_tool_call(text: str, request_body: dict) -> dict | None:
+    if not _cli_tool_definitions(request_body):
+        return None
+
+    parsed = _jsonish_tool_arguments(text)
+    if parsed is None:
+        return None
+    try:
+        data = json.loads(parsed)
+    except Exception:
+        return None
+
+    tool_call = data.get("tool_call") if isinstance(data, dict) else None
+    if not isinstance(tool_call, dict):
+        return None
+
+    name = tool_call.get("name")
+    allowed = {tool["name"] for tool in _cli_tool_definitions(request_body)}
+    if not name or name not in allowed:
+        return None
+
+    arguments = tool_call.get("arguments")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, (dict, list)):
+        return None
+
+    return {
+        "id": f"call_cli_{int(time.time() * 1000)}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def _openai_cli_response(text: str, model: str, tokens_in: int, tokens_out: int, request_body: dict | None = None) -> dict:
+    tool_call = _extract_cli_tool_call(text, request_body or {})
+    message = {"role": "assistant", "content": text}
+    finish_reason = "stop"
+    if tool_call:
+        message = {"role": "assistant", "content": None, "tool_calls": [tool_call]}
+        finish_reason = "tool_calls"
+
     return {
         "id": f"chatcmpl-cli-{int(time.time() * 1000)}",
         "object": "chat.completion",
@@ -381,8 +465,8 @@ def _openai_cli_response(text: str, model: str, tokens_in: int, tokens_out: int)
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": {
             "prompt_tokens": tokens_in,
@@ -405,6 +489,35 @@ def _anthropic_cli_response(text: str, model: str, tokens_in: int, tokens_out: i
     }
 
 
+def _parse_claude_cli_json_output(out: str, request_body: dict) -> tuple[str, int, int, str | None]:
+    try:
+        data = json.loads(out)
+    except Exception:
+        tokens_in = _estimate_input_tokens(request_body)
+        tokens_out = _estimate_output_tokens_from_response(out)
+        return out, tokens_in, tokens_out, None
+
+    if not isinstance(data, dict) or data.get("type") != "result":
+        tokens_in = _estimate_input_tokens(request_body)
+        tokens_out = _estimate_output_tokens_from_response(data)
+        return out, tokens_in, tokens_out, None
+
+    result = data.get("result") or ""
+    if data.get("is_error"):
+        return result, 0, 0, result or "Claude CLI returned an error"
+
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    tokens_in = int(usage.get("input_tokens") or 0)
+    tokens_in += int(usage.get("cache_creation_input_tokens") or 0)
+    tokens_in += int(usage.get("cache_read_input_tokens") or 0)
+    tokens_out = int(usage.get("output_tokens") or 0)
+    if not tokens_in:
+        tokens_in = _estimate_input_tokens(request_body)
+    if not tokens_out:
+        tokens_out = _estimate_output_tokens_from_response(result)
+    return result, tokens_in, tokens_out, None
+
+
 async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_body: dict, native_anthropic: bool = False):
     body = copy.deepcopy(request_body)
     body["model"] = actual_model
@@ -417,7 +530,7 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
 
     prompt = _request_to_cli_prompt(body, native_anthropic=native_anthropic)
     binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
-    command = [binary, "-p", prompt]
+    command = [binary, "-p", prompt, "--bare", "--output-format", "json"]
     if actual_model:
         command.extend(["--model", actual_model])
 
@@ -455,11 +568,12 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
     if not out:
         return None, 502, latency, (err or "Claude CLI returned empty output")[:500], 0, 0
 
-    tokens_in = _estimate_input_tokens(body)
-    tokens_out = _estimate_output_tokens_from_response(out)
+    result_text, tokens_in, tokens_out, parsed_error = _parse_claude_cli_json_output(out, body)
+    if parsed_error:
+        return None, 502, latency, parsed_error[:500], tokens_in, tokens_out
     if native_anthropic:
-        return _anthropic_cli_response(out, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
-    return _openai_cli_response(out, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
+        return _anthropic_cli_response(result_text, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
+    return _openai_cli_response(result_text, actual_model, tokens_in, tokens_out, body), 200, latency, None, tokens_in, tokens_out
 
 
 async def _proxy_claude_cli_attempt(provider: dict, key: dict, actual_model: str, request_body: dict, local_key_id: str, fallback_chain: list, native_anthropic: bool = False):

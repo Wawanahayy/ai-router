@@ -19,7 +19,7 @@ PROVIDER_PRESETS = {
     "novai": {"name": "NovAI", "type": "openai-compatible", "base_url": "https://aiapi-pro.com/v1", "prefix": "novai", "prefix_enabled": 0},
     "openai": {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 0},
     "anthropic": {"name": "Anthropic", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "anthropic", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages"},
-    "claude-cli": {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "request_format": "anthropic-compatible", "supports_tools": 0, "supports_streaming": 0},
+    "claude-cli": {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 0},
     "nvidia": {"name": "Nvidia NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 0},
     "openrouter": {"name": "OpenRouter", "type": "openai-compatible", "base_url": "https://openrouter.ai/api/v1", "prefix": "openrouter", "prefix_enabled": 0},
     "groq": {"name": "Groq", "type": "openai-compatible", "base_url": "https://api.groq.com/openai/v1", "prefix": "groq", "prefix_enabled": 0},
