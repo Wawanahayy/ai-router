@@ -4,10 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from . import db, proxy, config
+import asyncio
+import logging
 import os
 import time
 
 app = FastAPI(title="AI Router", version="2.0.0")
+logger = logging.getLogger(__name__)
+pricing_sync_task = None
+PRICING_SYNC_INTERVAL = float(os.getenv("AI_ROUTER_PRICING_SYNC_INTERVAL", "60"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,12 +78,36 @@ async def protect_management_api(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup():
+    global pricing_sync_task
     await db.get_db()
+    if PRICING_SYNC_INTERVAL > 0:
+        pricing_sync_task = asyncio.create_task(pricing_sync_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    global pricing_sync_task
+    if pricing_sync_task:
+        pricing_sync_task.cancel()
+        try:
+            await pricing_sync_task
+        except asyncio.CancelledError:
+            pass
+        pricing_sync_task = None
     await db.close_db()
+
+
+async def pricing_sync_loop():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            result = await db.sync_openrouter_pricing()
+            logger.info("Pricing catalog sync complete: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Pricing catalog sync failed; keeping previous prices: %s", e)
+        await asyncio.sleep(PRICING_SYNC_INTERVAL)
 
 
 @app.get("/v1/health")
