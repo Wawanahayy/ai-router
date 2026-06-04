@@ -528,7 +528,7 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
 
     prompt = _request_to_cli_prompt(body, native_anthropic=native_anthropic)
     binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
-    command = [binary, "-p", "--bare", "--output-format", "json"]
+    command = [binary, "-p", "--bare", "--no-session-persistence", "--output-format", "json"]
     if actual_model:
         command.extend(["--model", actual_model])
 
