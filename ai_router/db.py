@@ -543,6 +543,25 @@ def _model_lock_seconds(error_code: int, error_msg: str = ""):
     return 30
 
 
+def is_context_limit_error(error_code: int, error_msg: str = ""):
+    if error_code not in (400, 413, 422):
+        return False
+    lowered = (error_msg or "").lower()
+    needles = (
+        "input token exceed",
+        "token exceed",
+        "context length",
+        "context_length",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "prompt is too long",
+        "request too large",
+        "quota_limit_reached",
+    )
+    return any(needle in lowered for needle in needles)
+
+
 def _global_key_dead(error_code: int, error_msg: str = ""):
     if error_code not in (401, 403):
         return False
@@ -564,6 +583,8 @@ async def lock_key_model(key_id: str, model: str, error_code: int, error_msg: st
 
 
 async def mark_key_error(key_id: str, error_code: int, error_msg: str, model: str = None):
+    if is_context_limit_error(error_code, error_msg):
+        return "alive"
     db = await get_db()
     status = "alive"
     cooldown_until = None

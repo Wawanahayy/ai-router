@@ -238,6 +238,8 @@ async def authenticate_local_key(auth_header: str):
 
 
 def _error_kind(status_code: int, error_msg: str = ""):
+    if db.is_context_limit_error(status_code, error_msg):
+        return "context_length_exceeded"
     if status_code in (401, 403):
         return "auth_dead"
     if status_code == 429:
