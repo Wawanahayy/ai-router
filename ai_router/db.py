@@ -5,6 +5,7 @@ import logging
 import uuid
 import re
 from . import config
+from .services.pricing import fetch_openrouter_pricing
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +107,24 @@ CREATE TABLE IF NOT EXISTS request_logs (
   model TEXT,
   tokens_in INTEGER DEFAULT 0,
   tokens_out INTEGER DEFAULT 0,
+  input_cost_usd REAL DEFAULT 0,
+  output_cost_usd REAL DEFAULT 0,
+  total_cost_usd REAL DEFAULT 0,
+  pricing_source TEXT DEFAULT '',
   latency_ms INTEGER DEFAULT 0,
   status_code INTEGER,
   error TEXT,
   fallback_chain TEXT,
   created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+  model_key TEXT PRIMARY KEY,
+  model_id TEXT NOT NULL,
+  input_per_million REAL DEFAULT 0,
+  output_per_million REAL DEFAULT 0,
+  source TEXT DEFAULT '',
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -155,7 +169,6 @@ async def get_db() -> aiosqlite.Connection:
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         await _db.executescript(SCHEMA)
-        # Safe migrations for existing DBs
         for mig in [
             "ALTER TABLE providers ADD COLUMN prefix_enabled INTEGER DEFAULT 0",
             "ALTER TABLE providers ADD COLUMN supports_tools INTEGER DEFAULT 1",
@@ -181,6 +194,18 @@ async def get_db() -> aiosqlite.Connection:
             )""",
             "ALTER TABLE request_logs ADD COLUMN local_key_id TEXT",
             "ALTER TABLE request_logs ADD COLUMN fallback_chain TEXT",
+            "ALTER TABLE request_logs ADD COLUMN input_cost_usd REAL DEFAULT 0",
+            "ALTER TABLE request_logs ADD COLUMN output_cost_usd REAL DEFAULT 0",
+            "ALTER TABLE request_logs ADD COLUMN total_cost_usd REAL DEFAULT 0",
+            "ALTER TABLE request_logs ADD COLUMN pricing_source TEXT DEFAULT ''",
+            """CREATE TABLE IF NOT EXISTS model_pricing (
+              model_key TEXT PRIMARY KEY,
+              model_id TEXT NOT NULL,
+              input_per_million REAL DEFAULT 0,
+              output_per_million REAL DEFAULT 0,
+              source TEXT DEFAULT '',
+              updated_at TEXT DEFAULT (datetime('now'))
+            )""",
             "ALTER TABLE combos ADD COLUMN mode TEXT DEFAULT 'round_robin'",
             "ALTER TABLE combo_models ADD COLUMN alias TEXT DEFAULT ''",
             "ALTER TABLE combo_models ADD COLUMN sort_order INTEGER DEFAULT 0",
@@ -906,12 +931,141 @@ async def resolve_combo_candidates(combo_name: str):
     return ordered
 
 
+def _pricing_key(model: str) -> str:
+    return (model or "").strip().lower()
+
+
+async def upsert_model_pricing(model_id: str, input_per_million: float, output_per_million: float, source: str = "manual"):
+    db = await get_db()
+    model_key = _pricing_key(model_id)
+    if not model_key:
+        return None
+    await db.execute(
+        """
+        INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, source, updated_at)
+        VALUES (?,?,?,?,?,datetime('now'))
+        ON CONFLICT(model_key) DO UPDATE SET
+          model_id=excluded.model_id,
+          input_per_million=excluded.input_per_million,
+          output_per_million=excluded.output_per_million,
+          source=excluded.source,
+          updated_at=datetime('now')
+        """,
+        (model_key, model_id, float(input_per_million or 0), float(output_per_million or 0), source),
+    )
+    await db.commit()
+    await recalculate_log_costs(model_id)
+    return await get_model_pricing(model_id)
+
+
+async def get_model_pricing(model: str):
+    db = await get_db()
+    model_key = _pricing_key(model)
+    if not model_key:
+        return None
+    cursor = await db.execute("SELECT * FROM model_pricing WHERE model_key=?", (model_key,))
+    row = await cursor.fetchone()
+    if row:
+        return dict(row)
+    cursor = await db.execute(
+        """
+        SELECT * FROM model_pricing
+        WHERE model_key LIKE ?
+        ORDER BY (input_per_million + output_per_million) ASC, model_key ASC
+        LIMIT 1
+        """,
+        (f"%/{model_key}",),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_model_pricing(limit: int = 500):
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT * FROM model_pricing ORDER BY updated_at DESC, model_id ASC LIMIT ?",
+        (limit,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def sync_openrouter_pricing():
+    rows = await fetch_openrouter_pricing()
+    db = await get_db()
+    count = 0
+    for row in rows:
+        model_id = row.get("model_id") or ""
+        if not model_id:
+            continue
+        await db.execute(
+            """
+            INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, source, updated_at)
+            VALUES (?,?,?,?,?,datetime('now'))
+            ON CONFLICT(model_key) DO UPDATE SET
+              model_id=excluded.model_id,
+              input_per_million=excluded.input_per_million,
+              output_per_million=excluded.output_per_million,
+              source=excluded.source,
+              updated_at=datetime('now')
+            """,
+            (
+                _pricing_key(model_id),
+                model_id,
+                float(row.get("input_per_million") or 0),
+                float(row.get("output_per_million") or 0),
+                row.get("source") or "openrouter",
+            ),
+        )
+        count += 1
+    await db.commit()
+    logs_updated = await recalculate_log_costs()
+    return {"source": "openrouter", "models": count, "logs_updated": logs_updated}
+
+
+async def calculate_model_cost(model: str, tokens_in: int, tokens_out: int):
+    pricing = await get_model_pricing(model)
+    if not pricing:
+        return 0.0, 0.0, 0.0, ""
+    input_cost = (int(tokens_in or 0) / 1_000_000) * float(pricing.get("input_per_million") or 0)
+    output_cost = (int(tokens_out or 0) / 1_000_000) * float(pricing.get("output_per_million") or 0)
+    total_cost = input_cost + output_cost
+    return input_cost, output_cost, total_cost, pricing.get("source") or ""
+
+
+async def recalculate_log_costs(model: str | None = None):
+    db = await get_db()
+    q = "SELECT id, model, tokens_in, tokens_out FROM request_logs"
+    vals = []
+    if model:
+        q += " WHERE lower(model)=? OR lower(model)=?"
+        vals.extend([_pricing_key(model), _pricing_key(model).split("/")[-1]])
+    cursor = await db.execute(q, vals)
+    rows = await cursor.fetchall()
+    updated = 0
+    for row in rows:
+        input_cost, output_cost, total_cost, pricing_source = await calculate_model_cost(row["model"], row["tokens_in"], row["tokens_out"])
+        if not pricing_source:
+            continue
+        await db.execute(
+            """
+            UPDATE request_logs
+            SET input_cost_usd=?, output_cost_usd=?, total_cost_usd=?, pricing_source=?
+            WHERE id=?
+            """,
+            (input_cost, output_cost, total_cost, pricing_source, row["id"]),
+        )
+        updated += 1
+    await db.commit()
+    return updated
+
+
 async def add_log(provider_id: str, key_id: str, model: str, tokens_in: int, tokens_out: int, latency_ms: int, status_code: int, error: str = None, local_key_id: str = None, fallback_chain=None):
     db = await get_db()
     chain_value = json.dumps(fallback_chain) if isinstance(fallback_chain, (list, dict)) else fallback_chain
+    input_cost, output_cost, total_cost, pricing_source = await calculate_model_cost(model, tokens_in, tokens_out)
     await db.execute(
-        "INSERT INTO request_logs (provider_id, key_id, local_key_id, model, tokens_in, tokens_out, latency_ms, status_code, error, fallback_chain) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (provider_id, key_id, local_key_id, model, tokens_in, tokens_out, latency_ms, status_code, error, chain_value)
+        "INSERT INTO request_logs (provider_id, key_id, local_key_id, model, tokens_in, tokens_out, input_cost_usd, output_cost_usd, total_cost_usd, pricing_source, latency_ms, status_code, error, fallback_chain) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (provider_id, key_id, local_key_id, model, tokens_in, tokens_out, input_cost, output_cost, total_cost, pricing_source, latency_ms, status_code, error, chain_value)
     )
     await db.commit()
 
@@ -937,8 +1091,39 @@ async def get_stats():
     cursor = await db.execute("SELECT COALESCE(SUM(tokens_in + tokens_out), 0) as total FROM request_logs WHERE date(created_at) = date('now')")
     row = await cursor.fetchone()
     tokens_today = row["total"] if row else 0
-    cursor = await db.execute("SELECT p.name, COUNT(l.id) as requests, COALESCE(SUM(l.tokens_in+l.tokens_out),0) as tokens FROM request_logs l LEFT JOIN providers p ON l.provider_id=p.id WHERE date(l.created_at)=date('now') GROUP BY l.provider_id")
+    cursor = await db.execute("SELECT p.name, COUNT(l.id) as requests, COALESCE(SUM(l.tokens_in+l.tokens_out),0) as tokens, COALESCE(SUM(l.total_cost_usd),0) as cost_usd FROM request_logs l LEFT JOIN providers p ON l.provider_id=p.id WHERE date(l.created_at)=date('now') GROUP BY l.provider_id")
     provider_stats = [dict(r) for r in await cursor.fetchall()]
+    usage_periods = {}
+    for name, condition in {
+        "daily": "date(created_at) = date('now')",
+        "weekly": "datetime(created_at) >= datetime('now', '-7 days')",
+        "monthly": "datetime(created_at) >= datetime('now', '-30 days')",
+        "all_time": "1=1",
+    }.items():
+        cursor = await db.execute(
+            f"""
+            SELECT
+              COUNT(*) as requests,
+              COALESCE(SUM(tokens_in), 0) as tokens_in,
+              COALESCE(SUM(tokens_out), 0) as tokens_out,
+              COALESCE(SUM(tokens_in + tokens_out), 0) as tokens_total,
+              COALESCE(SUM(input_cost_usd), 0) as input_cost_usd,
+              COALESCE(SUM(output_cost_usd), 0) as output_cost_usd,
+              COALESCE(SUM(total_cost_usd), 0) as total_cost_usd
+            FROM request_logs
+            WHERE {condition}
+            """
+        )
+        row = await cursor.fetchone()
+        usage_periods[name] = dict(row) if row else {
+            "requests": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_total": 0,
+            "input_cost_usd": 0,
+            "output_cost_usd": 0,
+            "total_cost_usd": 0,
+        }
     cursor = await db.execute("SELECT status, COUNT(*) as cnt FROM api_keys GROUP BY status")
     key_stats = {}
     for r in await cursor.fetchall():
@@ -955,6 +1140,7 @@ async def get_stats():
     return {
         "total_today": total_today,
         "tokens_today": tokens_today,
+        "usage_periods": usage_periods,
         "provider_stats": provider_stats,
         "key_stats": key_stats,
         "active_providers": active_providers,

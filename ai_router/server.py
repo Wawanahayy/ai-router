@@ -421,6 +421,30 @@ async def api_get_stats():
     return await db.get_stats()
 
 
+@app.get("/api/pricing")
+async def api_list_pricing(limit: int = 500):
+    return await db.list_model_pricing(limit)
+
+
+@app.post("/api/pricing/sync-openrouter")
+async def api_sync_openrouter_pricing():
+    try:
+        return await db.sync_openrouter_pricing()
+    except Exception as e:
+        raise HTTPException(502, f"Pricing sync failed: {str(e)[:300]}")
+
+
+@app.put("/api/pricing/{model_id:path}")
+async def api_upsert_pricing(model_id: str, request: Request):
+    data = await request.json()
+    return await db.upsert_model_pricing(
+        model_id,
+        data.get("input_per_million", 0),
+        data.get("output_per_million", 0),
+        data.get("source", "manual"),
+    )
+
+
 @app.get("/api/settings")
 async def api_get_settings():
     return await db.get_all_settings()

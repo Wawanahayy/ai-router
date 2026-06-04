@@ -56,6 +56,8 @@ export const deactivateAlias = (alias) => apiFetch('/api/aliases/deactivate', { 
 
 export const getLogs = (limit = 100) => apiFetch(`/api/logs?limit=${limit}`)
 export const getStats = () => apiFetch('/api/stats')
+export const getPricing = (limit = 500) => apiFetch(`/api/pricing?limit=${limit}`)
+export const syncOpenRouterPricing = () => apiFetch('/api/pricing/sync-openrouter', { method: 'POST' })
 
 export const getSettings = () => apiFetch('/api/settings')
 export const updateSettings = (data) => apiFetch('/api/settings', { method: 'PUT', body: JSON.stringify(data) })
