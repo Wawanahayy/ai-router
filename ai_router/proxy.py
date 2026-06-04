@@ -256,7 +256,13 @@ def _fallbackable(status_code: int):
 
 
 def _transient_wait_seconds(status_code: int):
+    if status_code == 429:
+        return 2
     return 5 if status_code in (502, 503, 504) else 0
+
+
+def _rate_limit_wait_seconds(attempt_count: int):
+    return min(2 ** min(max(attempt_count - 1, 0), 3), 8)
 
 
 def _chain_item(provider, key, model, status_code, error_msg, latency_ms):
@@ -1075,6 +1081,8 @@ async def _proxy_anthropic_native_stream(prepared: dict, provider: dict, key: di
                         await db.mark_key_error(key["id"], resp.status_code, error_msg, model)
                         latency = int((time.time() - start) * 1000)
                         await db.add_log(provider["id"], key["id"], model, 0, 0, latency, resp.status_code, error_msg, local_key_id)
+                        if resp.status_code == 429:
+                            await asyncio.sleep(_rate_limit_wait_seconds(1))
                         yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': error_msg}}, ensure_ascii=False)}\n\n".encode()
                         return
 

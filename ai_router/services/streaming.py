@@ -26,6 +26,10 @@ def _timeout_value(seconds: float):
     return None if seconds <= 0 else seconds
 
 
+def _rate_limit_wait_seconds(attempt_count: int):
+    return min(2 ** min(max(attempt_count - 1, 0), 3), 8)
+
+
 def _estimate_input_tokens(body: dict) -> int:
     try:
         return max(0, int((len(json.dumps(body or {}, ensure_ascii=False)) + 3) / 4))
@@ -404,7 +408,9 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                             last_error = f"Upstream returned {resp.status_code}: {error_msg}"
                             if index < len(attempts) - 1:
                                 next_group = attempts[index + 1].get("group")
-                                if next_group != attempt.get("group") and resp.status_code in (502, 503, 504) and STREAM_TRANSIENT_WAIT > 0:
+                                if resp.status_code == 429 and next_group != attempt.get("group"):
+                                    await asyncio.sleep(_rate_limit_wait_seconds(index + 1))
+                                elif next_group != attempt.get("group") and resp.status_code in (502, 503, 504) and STREAM_TRANSIENT_WAIT > 0:
                                     await asyncio.sleep(STREAM_TRANSIENT_WAIT)
                                 continue
                             yield error_chunk(last_error)
