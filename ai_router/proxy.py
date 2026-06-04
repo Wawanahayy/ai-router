@@ -106,7 +106,7 @@ async def resolve_model(model: str):
     3. Check if alias exists but deactivated -> return None (explicit reject)
     4. Prefix match (only if provider prefix_enabled=1): "prefix/model" -> find provider + active alias
     5. Direct model name -> round-robin across providers that have this model active
-    6. Fallback: round-robin across active providers with alive keys
+    6. Unknown explicit model -> reject instead of routing randomly
     """
     if not model or not model.strip():
         return await _auto_pick_rr()
@@ -164,7 +164,7 @@ async def resolve_model(model: str):
         await db._set_rr(f"model_rr_{lookup_model}", (rr + 1) % len(matching))
         return picked["id"], actual_model
     
-    return await _auto_pick_rr()
+    return None, requested_model
 
 
 async def _auto_pick_rr():
