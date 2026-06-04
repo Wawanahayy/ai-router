@@ -8,6 +8,7 @@ export default function Logs() {
   const [expanded, setExpanded] = useState(null)
   const [stats, setStats] = useState(null)
   const [syncingPricing, setSyncingPricing] = useState(false)
+  const [pricingStatus, setPricingStatus] = useState('')
 
   const load = useCallback(async () => {
     try {
@@ -35,11 +36,14 @@ export default function Logs() {
 
   async function handleSyncPricing() {
     setSyncingPricing(true)
+    setPricingStatus('')
     try {
-      await syncOpenRouterPricing()
+      const result = await syncOpenRouterPricing()
+      setPricingStatus(`Synced ${result.models || 0} catalog prices, updated ${result.logs_updated || 0} logs.`)
       await load()
     } catch (e) {
       console.error(e)
+      setPricingStatus('Price sync failed.')
     } finally {
       setSyncingPricing(false)
     }
@@ -60,11 +64,14 @@ export default function Logs() {
             <option value={500}>500</option>
           </select>
           <button onClick={handleSyncPricing} className="btn-ghost text-sm" disabled={syncingPricing}>
-            {syncingPricing ? 'Syncing...' : 'Sync prices'}
+            {syncingPricing ? 'Syncing...' : 'Sync official prices'}
           </button>
           <button onClick={load} className="btn-ghost text-sm">Refresh</button>
         </div>
       </div>
+      {pricingStatus && (
+        <div className="text-xs text-slate-400 -mt-3">{pricingStatus}</div>
+      )}
 
       <div className="grid grid-cols-4 gap-3">
         {[
@@ -76,6 +83,9 @@ export default function Logs() {
           <div key={label} className="card space-y-2">
             <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
             <div className="text-lg font-semibold text-white">{formatUsd(usage?.total_cost_usd || 0)}</div>
+            {(usage?.unpriced_tokens || 0) > 0 && (
+              <div className="text-xs text-amber-300">{formatNum(usage.unpriced_tokens)} tokens unpriced</div>
+            )}
             <div className="grid grid-cols-2 gap-2 text-xs">
               <div>
                 <span className="text-slate-500">Input</span>
@@ -86,7 +96,10 @@ export default function Logs() {
                 <div className="text-slate-300">{formatNum(usage?.tokens_out || 0)}</div>
               </div>
             </div>
-            <div className="text-xs text-slate-600">{formatNum(usage?.tokens_total || 0)} tokens / {usage?.requests || 0} req</div>
+            <div className="text-xs text-slate-600">
+              {formatNum(usage?.tokens_total || 0)} tokens / {usage?.requests || 0} req
+              {(usage?.priced_requests || 0) > 0 ? ` / ${usage.priced_requests} priced` : ''}
+            </div>
           </div>
         ))}
       </div>
@@ -131,12 +144,12 @@ export default function Logs() {
                         {(l.tokens_in || l.tokens_out) ? `${l.tokens_in || 0}+${l.tokens_out || 0}` : '-'}
                       </td>
                       <td className="py-2 px-2 text-xs text-slate-500">
-                        {l.total_cost_usd ? (
+                        {l.pricing_source ? (
                           <div>
                             <div>{formatUsd(l.total_cost_usd)}</div>
                             <div className="text-slate-600">{formatUsd(l.input_cost_usd || 0)}+{formatUsd(l.output_cost_usd || 0)}</div>
                           </div>
-                        ) : '-'}
+                        ) : <span className="text-amber-300">unpriced</span>}
                       </td>
                       <td className="py-2 px-2 text-xs text-red-400 max-w-[250px] truncate">{l.error || '-'}</td>
                       <td className="py-2 px-2 text-xs">

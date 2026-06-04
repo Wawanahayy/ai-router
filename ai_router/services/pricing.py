@@ -27,6 +27,6 @@ async def fetch_openrouter_pricing():
             "model_id": model_id,
             "input_per_million": input_per_million,
             "output_per_million": output_per_million,
-            "source": "openrouter",
+            "source": "openrouter_catalog",
         })
     return rows

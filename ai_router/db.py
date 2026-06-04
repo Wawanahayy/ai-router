@@ -935,6 +935,13 @@ def _pricing_key(model: str) -> str:
     return (model or "").strip().lower()
 
 
+def _pricing_slug(model: str) -> str:
+    value = _pricing_key(model)
+    if "/" in value:
+        value = value.split("/", 1)[1]
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
 async def upsert_model_pricing(model_id: str, input_per_million: float, output_per_million: float, source: str = "manual"):
     db = await get_db()
     model_key = _pricing_key(model_id)
@@ -977,7 +984,22 @@ async def get_model_pricing(model: str):
         (f"%/{model_key}",),
     )
     row = await cursor.fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+
+    requested_slug = _pricing_slug(model)
+    if not requested_slug:
+        return None
+    cursor = await db.execute("SELECT * FROM model_pricing")
+    candidates = [dict(r) for r in await cursor.fetchall()]
+    for candidate in candidates:
+        if _pricing_slug(candidate.get("model_id")) == requested_slug:
+            return candidate
+    for candidate in candidates:
+        candidate_slug = _pricing_slug(candidate.get("model_id"))
+        if requested_slug in candidate_slug or candidate_slug in requested_slug:
+            return candidate
+    return None
 
 
 async def list_model_pricing(limit: int = 500):
@@ -1013,13 +1035,13 @@ async def sync_openrouter_pricing():
                 model_id,
                 float(row.get("input_per_million") or 0),
                 float(row.get("output_per_million") or 0),
-                row.get("source") or "openrouter",
+                row.get("source") or "openrouter_catalog",
             ),
         )
         count += 1
     await db.commit()
     logs_updated = await recalculate_log_costs()
-    return {"source": "openrouter", "models": count, "logs_updated": logs_updated}
+    return {"source": "openrouter_catalog", "models": count, "logs_updated": logs_updated}
 
 
 async def calculate_model_cost(model: str, tokens_in: int, tokens_out: int):
@@ -1107,6 +1129,10 @@ async def get_stats():
               COALESCE(SUM(tokens_in), 0) as tokens_in,
               COALESCE(SUM(tokens_out), 0) as tokens_out,
               COALESCE(SUM(tokens_in + tokens_out), 0) as tokens_total,
+              COALESCE(SUM(CASE WHEN pricing_source != '' THEN tokens_in + tokens_out ELSE 0 END), 0) as priced_tokens,
+              COALESCE(SUM(CASE WHEN pricing_source = '' THEN tokens_in + tokens_out ELSE 0 END), 0) as unpriced_tokens,
+              COALESCE(SUM(CASE WHEN pricing_source != '' THEN 1 ELSE 0 END), 0) as priced_requests,
+              COALESCE(SUM(CASE WHEN pricing_source = '' THEN 1 ELSE 0 END), 0) as unpriced_requests,
               COALESCE(SUM(input_cost_usd), 0) as input_cost_usd,
               COALESCE(SUM(output_cost_usd), 0) as output_cost_usd,
               COALESCE(SUM(total_cost_usd), 0) as total_cost_usd
@@ -1120,6 +1146,10 @@ async def get_stats():
             "tokens_in": 0,
             "tokens_out": 0,
             "tokens_total": 0,
+            "priced_tokens": 0,
+            "unpriced_tokens": 0,
+            "priced_requests": 0,
+            "unpriced_requests": 0,
             "input_cost_usd": 0,
             "output_cost_usd": 0,
             "total_cost_usd": 0,
