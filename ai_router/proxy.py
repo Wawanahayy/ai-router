@@ -528,7 +528,7 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
 
     prompt = _request_to_cli_prompt(body, native_anthropic=native_anthropic)
     binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
-    command = [binary, "-p", prompt, "--bare", "--output-format", "json"]
+    command = [binary, "-p", "--bare", "--output-format", "json"]
     if actual_model:
         command.extend(["--model", actual_model])
 
@@ -537,11 +537,15 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_claude_cli_env(provider, key, actual_model),
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_timeout_value(CLAUDE_CLI_TIMEOUT))
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode("utf-8")),
+            timeout=_timeout_value(CLAUDE_CLI_TIMEOUT),
+        )
     except asyncio.TimeoutError:
         latency = int((time.time() - start) * 1000)
         if proc:
