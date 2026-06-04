@@ -650,6 +650,58 @@ def _synthetic_openai_stream(response_data: dict, model: str):
     )
 
 
+def _claude_cli_live_synthetic_stream(provider: dict, key: dict, actual_model: str, request_body: dict, local_key_id: str, fallback_chain: list):
+    async def generate():
+        base_id = f"chatcmpl-cli-stream-{int(time.time() * 1000)}"
+        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {"role": "assistant"}), ensure_ascii=False) + "\n\n"
+        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {"content": ""}), ensure_ascii=False) + "\n\n"
+
+        body = copy.deepcopy(request_body)
+        body["stream"] = False
+        response_data, status, error_msg = await _proxy_claude_cli_attempt(
+            provider, key, actual_model, body, local_key_id, fallback_chain
+        )
+        if status >= 400:
+            error_text = error_msg or "Claude CLI stream failed"
+            yield "data: " + json.dumps(
+                _openai_stream_chunk(base_id, actual_model, {"content": error_text}, "stop"),
+                ensure_ascii=False,
+            ) + "\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        choice = (response_data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason") or "stop"
+        tool_calls = message.get("tool_calls")
+        content = message.get("content")
+
+        if tool_calls:
+            stream_tool_calls = []
+            for idx, tool_call in enumerate(tool_calls):
+                item = dict(tool_call)
+                item.setdefault("index", idx)
+                stream_tool_calls.append(item)
+            yield "data: " + json.dumps(
+                _openai_stream_chunk(base_id, actual_model, {"tool_calls": stream_tool_calls}),
+                ensure_ascii=False,
+            ) + "\n\n"
+        elif content:
+            yield "data: " + json.dumps(
+                _openai_stream_chunk(base_id, actual_model, {"content": content}),
+                ensure_ascii=False,
+            ) + "\n\n"
+
+        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {}, finish_reason), ensure_ascii=False) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
 def _normalize_messages(body: dict, provider: dict | None = None, model: str = ""):
     """Make chat history acceptable for stricter OpenAI-compatible validators."""
     messages = body.get("messages")
@@ -894,24 +946,7 @@ async def _proxy_stream_with_fallback(request_body: dict, attempts: list, local_
             continue
 
         if provider.get("type") == "claude-cli":
-            fallback_chain = []
-            last_status = 502
-            for key in keys:
-                body = copy.deepcopy(request_body)
-                body["stream"] = False
-                response_data, status, error_msg = await _proxy_claude_cli_attempt(
-                    provider, key, actual_model, body, local_key_id, fallback_chain
-                )
-                if status < 400:
-                    return _synthetic_openai_stream(response_data, actual_model)
-                last_error = error_msg or last_error
-                last_status = status
-                if not _fallbackable(status):
-                    break
-            wait_seconds = _transient_wait_seconds(last_status)
-            if wait_seconds:
-                await asyncio.sleep(wait_seconds)
-            continue
+            return _claude_cli_live_synthetic_stream(provider, keys[0], actual_model, request_body, local_key_id, [])
 
         prepared = await _prepare_upstream(provider, copy.deepcopy(request_body), actual_model)
         for key in keys:
