@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  check:
+    name: Python and web checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Audit Python dependencies
+        run: |
+          python -m pip install pip-audit
+          pip-audit -r requirements.txt
+
+      - name: Compile Python
+        run: |
+          python - <<'PY'
+          import py_compile
+          from pathlib import Path
+
+          skip = {".git", ".venv", "venv", "node_modules", "dist", "build", "data", "free-credits"}
+          for path in Path(".").rglob("*.py"):
+              if any(part in skip for part in path.parts):
+                  continue
+              py_compile.compile(str(path), doraise=True)
+          PY
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Audit web dependencies
+        working-directory: web
+        run: npm audit --audit-level=moderate
+
+      - name: Lint web
+        working-directory: web
+        run: npm run lint
+
+      - name: Build web
+        run: python scripts/build_static.py
