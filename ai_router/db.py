@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS providers (
   models_path TEXT DEFAULT '',
   request_format TEXT DEFAULT '',
   anthropic_version TEXT DEFAULT '2023-06-01',
-  working_directory TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -143,7 +142,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('rr_counter', '0');
 PROVIDER_PRESETS = [
     {"name": "Custom OpenAI Compatible", "type": "openai-compatible", "base_url": "https://example.com/v1", "prefix": "custom", "prefix_enabled": 0, "auth_type": "bearer", "chat_path": "/chat/completions", "models_path": "/models"},
     {"name": "Custom Claude / Anthropic Compatible", "type": "anthropic-compatible", "base_url": "https://example.com/v1", "prefix": "custom-claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "anthropic_version": "2023-06-01"},
-    {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "models_path": "", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 1, "supports_json_mode": 1, "anthropic_version": "2023-06-01", "working_directory": ""},
+    {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "models_path": "", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 1, "supports_json_mode": 1, "anthropic_version": "2023-06-01"},
     {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 0},
     {"name": "Anthropic (Claude)", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages"},
     {"name": "NVIDIA NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 0},
@@ -182,7 +181,6 @@ async def get_db() -> aiosqlite.Connection:
             "ALTER TABLE providers ADD COLUMN models_path TEXT DEFAULT ''",
             "ALTER TABLE providers ADD COLUMN request_format TEXT DEFAULT ''",
             "ALTER TABLE providers ADD COLUMN anthropic_version TEXT DEFAULT '2023-06-01'",
-            "ALTER TABLE providers ADD COLUMN working_directory TEXT DEFAULT ''",
             """CREATE TABLE IF NOT EXISTS key_model_locks (
               key_id TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
               model TEXT NOT NULL,
@@ -257,7 +255,6 @@ def _normalize_provider_data(data: dict, existing: dict | None = None) -> dict:
 
     effective_format = request_format or ("anthropic-compatible" if provider_type == "claude-cli" else provider_type)
     merged["base_url"] = (merged.get("base_url") or "").strip().rstrip("/")
-    merged["working_directory"] = (merged.get("working_directory") or "").strip()
     merged["prefix"] = (merged.get("prefix") or "").strip()
     merged["prefix_enabled"] = int(merged.get("prefix_enabled", 0))
     merged["api_type"] = merged.get("api_type") or "chat"
@@ -329,14 +326,14 @@ async def create_provider(data: dict):
     if "prefix_enabled" in data:
         prefix_enabled = int(data["prefix_enabled"])
     await db.execute(
-        "INSERT INTO providers (id, name, type, base_url, prefix, prefix_enabled, api_type, is_active, supports_tools, supports_streaming, supports_json_mode, extra_headers, auth_type, auth_header, auth_prefix, key_query_param, chat_path, models_path, request_format, anthropic_version, working_directory) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO providers (id, name, type, base_url, prefix, prefix_enabled, api_type, is_active, supports_tools, supports_streaming, supports_json_mode, extra_headers, auth_type, auth_header, auth_prefix, key_query_param, chat_path, models_path, request_format, anthropic_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (provider_id, data["name"], data.get("type", "openai-compatible"), data["base_url"],
          prefix, prefix_enabled, data.get("api_type", "chat"), 1,
          int(data.get("supports_tools", 1)), int(data.get("supports_streaming", 1)), int(data.get("supports_json_mode", 1)),
          json.dumps(data.get("extra_headers", {})),
          data.get("auth_type", ""), data.get("auth_header", ""), data.get("auth_prefix", ""),
          data.get("key_query_param", ""), data.get("chat_path", ""), data.get("models_path", ""),
-         data.get("request_format", ""), data.get("anthropic_version", "2023-06-01"), data.get("working_directory", ""))
+         data.get("request_format", ""), data.get("anthropic_version", "2023-06-01"))
     )
     await db.commit()
     return await get_provider(provider_id)
@@ -353,7 +350,7 @@ async def update_provider(provider_id: str, data: dict):
         requested_fields.update(("auth_type", "chat_path", "models_path", "anthropic_version"))
     sets = []
     vals = []
-    for field in ("name", "type", "base_url", "prefix", "prefix_enabled", "api_type", "is_active", "supports_tools", "supports_streaming", "supports_json_mode", "extra_headers", "auth_type", "auth_header", "auth_prefix", "key_query_param", "chat_path", "models_path", "request_format", "anthropic_version", "working_directory"):
+    for field in ("name", "type", "base_url", "prefix", "prefix_enabled", "api_type", "is_active", "supports_tools", "supports_streaming", "supports_json_mode", "extra_headers", "auth_type", "auth_header", "auth_prefix", "key_query_param", "chat_path", "models_path", "request_format", "anthropic_version"):
         if field in requested_fields:
             val = normalized[field]
             if field == "extra_headers":

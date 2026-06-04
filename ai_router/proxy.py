@@ -533,13 +533,6 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
     command = [binary, "-p", "--bare", "--no-session-persistence", "--output-format", "json"]
     if actual_model:
         command.extend(["--model", actual_model])
-    working_directory = (
-        (provider.get("working_directory") or "").strip()
-        or os.getenv("AI_ROUTER_CLAUDE_CLI_WORKDIR", "").strip()
-        or os.path.expanduser("~")
-    )
-    if working_directory and not os.path.isdir(working_directory):
-        return None, 500, 0, f"Claude CLI working directory not found: {working_directory}", 0, 0
 
     start = time.time()
     proc = None
@@ -550,7 +543,6 @@ async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_claude_cli_env(provider, key, actual_model),
-            cwd=working_directory,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=prompt.encode("utf-8")),

@@ -52,7 +52,6 @@ export default function Providers() {
     const modelsPathEl = form.querySelector('[name="models_path"]')
     const requestFormatEl = form.querySelector('[name="request_format"]')
     const anthropicVersionEl = form.querySelector('[name="anthropic_version"]')
-    const workingDirectoryEl = form.querySelector('[name="working_directory"]')
     if (nameEl) nameEl.value = p.name || ''
     if (urlEl) urlEl.value = p.base_url || ''
     if (typeEl) typeEl.value = p.type || 'openai-compatible'
@@ -67,7 +66,6 @@ export default function Providers() {
     if (modelsPathEl) modelsPathEl.value = p.models_path || ''
     if (requestFormatEl) requestFormatEl.value = p.request_format || ''
     if (anthropicVersionEl) anthropicVersionEl.value = p.anthropic_version || '2023-06-01'
-    if (workingDirectoryEl) workingDirectoryEl.value = p.working_directory || ''
     setFormModels(p.models || [])
   }
  }
@@ -109,7 +107,6 @@ export default function Providers() {
       models_path: fd.get('models_path') || '',
       request_format: fd.get('request_format') || '',
       anthropic_version: fd.get('anthropic_version') || '2023-06-01',
-      working_directory: fd.get('working_directory') || '',
       models: formModels,
     }
     if (!data.name || !data.base_url) return
@@ -177,7 +174,6 @@ export default function Providers() {
       models_path: fd.get('models_path') || '',
       request_format: fd.get('request_format') || '',
       anthropic_version: fd.get('anthropic_version') || '2023-06-01',
-      working_directory: fd.get('working_directory') || '',
     }
     if (!data.name || !data.base_url) return
     await updateProvider(providerId, data)
@@ -285,7 +281,7 @@ export default function Providers() {
   }
 
   const providerTypeHelp = formType === 'claude-cli'
-    ? 'Runs the local Claude CLI as an upstream provider. Base URL, API key, model, and optional working directory are passed to the CLI internally; models can be used directly or inside combos.'
+    ? 'Runs the local Claude CLI as an upstream provider. Base URL, API key, and model are passed to the CLI internally; models can be used directly or inside combos. Streaming and tools are disabled for this provider type.'
     : formType === 'anthropic-compatible'
       ? 'Use this for official Anthropic or Claude-compatible third-party APIs. Add its base URL, API key, and models here; those models can be used directly or inside combos.'
       : 'OpenAI-compatible upstream defaults to /chat/completions and /models. OpenAI-compatible clients call /v1/chat/completions.'
@@ -340,12 +336,6 @@ export default function Providers() {
               <label className="text-xs text-slate-500">Base URL *</label>
               <input name="base_url" className="input" placeholder={formType === 'claude-cli' ? 'https://api.anthropic.com/v1' : 'https://integrate.api.nvidia.com/v1'} required />
             </div>
-            {formType === 'claude-cli' && (
-              <div>
-                <label className="text-xs text-slate-500">Working Directory</label>
-                <input name="working_directory" className="input" placeholder="/root/bounty" />
-              </div>
-            )}
             <div className="flex items-end gap-2">
               <div className="flex-1">
                 <label className="text-xs text-slate-500">Prefix (optional)</label>
@@ -559,12 +549,6 @@ export default function Providers() {
                             <label className="text-xs text-slate-500">Base URL *</label>
                             <input name="base_url" className="input" defaultValue={p.base_url || ''} required />
                           </div>
-                          {editType === 'claude-cli' && (
-                            <div>
-                              <label className="text-xs text-slate-500">Working Directory</label>
-                              <input name="working_directory" className="input" defaultValue={p.working_directory || ''} placeholder="/root/bounty" />
-                            </div>
-                          )}
                           <div className="flex items-end gap-2">
                             <div className="flex-1">
                               <label className="text-xs text-slate-500">Prefix</label>
@@ -687,12 +671,6 @@ export default function Providers() {
                         <span className="text-slate-500">Paths:</span>
                         <span className="ml-2 text-slate-300 font-mono text-xs">{p.chat_path || 'default chat'} / {p.models_path || 'default models'}</span>
                       </div>
-                      {p.type === 'claude-cli' && (
-                        <div>
-                          <span className="text-slate-500">Working Dir:</span>
-                          <span className="ml-2 text-slate-300 font-mono text-xs">{p.working_directory || <span className="text-slate-600 italic">server default</span>}</span>
-                        </div>
-                      )}
                       <div>
                         <span className="text-slate-500">Prefix:</span>
                         <span className="ml-2 text-slate-300 font-mono text-xs">{effectivePrefix || <span className="text-slate-600 italic">none</span>}</span>
