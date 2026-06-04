@@ -769,7 +769,10 @@ async def proxy_chat_completions(request_body: dict, headers: dict, local_key_id
     # can corrupt the SSE response. We still try the combo/provider/key chain before
     # the first byte is sent, then stay on the first upstream that opens cleanly.
     if stream:
-        return await _proxy_stream_with_fallback(request_body, attempts, local_key_id)
+        stream_response = await _proxy_stream_with_fallback(request_body, attempts, local_key_id)
+        if isinstance(stream_response, tuple):
+            return stream_response
+        return stream_response, 200
 
     return await _proxy_with_fallback(request_body, attempts, local_key_id)
 
@@ -839,7 +842,8 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
 
             prepared = _prepare_anthropic_native(provider, copy.deepcopy(request_body), actual_model)
             if prepared["body"].get("stream"):
-                return await _proxy_anthropic_native_stream(prepared, provider, keys[0], actual_model, local_key_id)
+                stream_response = await _proxy_anthropic_native_stream(prepared, provider, keys[0], actual_model, local_key_id)
+                return stream_response, 200
 
             for key in keys:
                 auth = build_request(provider, "chat", key["key_value"], event_stream=bool(prepared["body"].get("stream")))
