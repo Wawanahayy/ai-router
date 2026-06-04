@@ -2,7 +2,7 @@
 
 Thanks for helping improve AI Router. This project is a local AI gateway for
 OpenAI-compatible clients, Anthropic-compatible clients, custom upstream
-providers, combos, fallback routing, streaming, and Claude CLI provider flows.
+providers, combos, fallback routing, and streaming.
 
 ## Before opening an issue
 
@@ -61,7 +61,6 @@ Commit the updated `ai_router/static` files with the source changes.
 - Explicit unknown model names should not silently route to a random provider.
 - Combos should resolve before direct provider/model routing.
 - Provider prefixes are optional and should not be required by default.
-- Claude CLI provider support is non-streaming and text-response focused.
 
 ## Pull request guidance
 

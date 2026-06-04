@@ -219,6 +219,7 @@ async def get_db() -> aiosqlite.Connection:
                 "UPDATE settings SET value=? WHERE key='login_password' AND (value IS NULL OR value='')",
                 (config.AUTH_PASSWORD,),
             )
+        await cleanup_context_limit_state(_db)
         await _db.commit()
     return _db
 
@@ -493,6 +494,7 @@ async def list_alive_keys(provider_id: str, advance: bool = True, model: str = N
         (provider_id, now)
     )
     await db.execute("DELETE FROM key_model_locks WHERE locked_until < ?", (now,))
+    await cleanup_context_limit_state(db)
     await db.commit()
     # Get alive keys ordered by last_used (round-robin: least recently used first)
     if model:
@@ -564,6 +566,38 @@ def is_context_limit_error(error_code: int, error_msg: str = ""):
     return any(needle in lowered for needle in needles)
 
 
+def _context_limit_sql_predicate(column: str):
+    lowered = f"lower(coalesce({column}, ''))"
+    return " OR ".join([
+        f"{lowered} LIKE '%input token exceed%'",
+        f"{lowered} LIKE '%token exceed%'",
+        f"{lowered} LIKE '%context length%'",
+        f"{lowered} LIKE '%context_length%'",
+        f"{lowered} LIKE '%maximum context%'",
+        f"{lowered} LIKE '%max context%'",
+        f"{lowered} LIKE '%too many tokens%'",
+        f"{lowered} LIKE '%prompt is too long%'",
+        f"{lowered} LIKE '%request too large%'",
+        f"{lowered} LIKE '%quota_limit_reached%'",
+    ])
+
+
+async def cleanup_context_limit_state(conn=None):
+    database = conn or await get_db()
+    await database.execute(
+        f"DELETE FROM key_model_locks WHERE {_context_limit_sql_predicate('error')}"
+    )
+    await database.execute(
+        f"""
+        UPDATE api_keys
+        SET status='alive', error_code=NULL, last_error=NULL, cooldown_until=NULL
+        WHERE {_context_limit_sql_predicate('last_error')}
+        """
+    )
+    if conn is None:
+        await database.commit()
+
+
 def _global_key_dead(error_code: int, error_msg: str = ""):
     if error_code not in (401, 403):
         return False
@@ -585,9 +619,16 @@ async def lock_key_model(key_id: str, model: str, error_code: int, error_msg: st
 
 
 async def mark_key_error(key_id: str, error_code: int, error_msg: str, model: str = None):
-    if is_context_limit_error(error_code, error_msg):
-        return "alive"
     db = await get_db()
+    if is_context_limit_error(error_code, error_msg):
+        await db.execute(
+            "UPDATE api_keys SET status='alive', error_code=NULL, last_error=NULL, cooldown_until=NULL WHERE id=?",
+            (key_id,),
+        )
+        if model:
+            await db.execute("DELETE FROM key_model_locks WHERE key_id=? AND LOWER(model)=LOWER(?)", (key_id, model))
+        await db.commit()
+        return "alive"
     status = "alive"
     cooldown_until = None
     if _global_key_dead(error_code, error_msg):
