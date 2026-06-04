@@ -1,15 +1,20 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import { getLogs } from '../api'
+import { getLogs, getStats, syncOpenRouterPricing } from '../api'
 
 export default function Logs() {
   const [logs, setLogs] = useState([])
   const [loading, setLoading] = useState(true)
   const [limit, setLimit] = useState(100)
   const [expanded, setExpanded] = useState(null)
+  const [stats, setStats] = useState(null)
+  const [syncingPricing, setSyncingPricing] = useState(false)
+  const [pricingStatus, setPricingStatus] = useState('')
 
   const load = useCallback(async () => {
     try {
-      setLogs(await getLogs(limit))
+      const [nextLogs, nextStats] = await Promise.all([getLogs(limit), getStats()])
+      setLogs(nextLogs)
+      setStats(nextStats)
     } catch (e) { console.error(e) }
     finally { setLoading(false) }
   }, [limit])
@@ -29,6 +34,23 @@ export default function Logs() {
     }
   }
 
+  async function handleSyncPricing() {
+    setSyncingPricing(true)
+    setPricingStatus('')
+    try {
+      const result = await syncOpenRouterPricing()
+      setPricingStatus(`Synced ${result.models || 0} catalog prices, updated ${result.logs_updated || 0} logs.`)
+      await load()
+    } catch (e) {
+      console.error(e)
+      setPricingStatus('Price sync failed.')
+    } finally {
+      setSyncingPricing(false)
+    }
+  }
+
+  const usagePeriods = stats?.usage_periods || {}
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -41,8 +63,45 @@ export default function Logs() {
             <option value={250}>250</option>
             <option value={500}>500</option>
           </select>
+          <button onClick={handleSyncPricing} className="btn-ghost text-sm" disabled={syncingPricing}>
+            {syncingPricing ? 'Syncing...' : 'Sync official prices'}
+          </button>
           <button onClick={load} className="btn-ghost text-sm">Refresh</button>
         </div>
+      </div>
+      {pricingStatus && (
+        <div className="text-xs text-slate-400 -mt-3">{pricingStatus}</div>
+      )}
+
+      <div className="grid grid-cols-4 gap-3">
+        {[
+          ['Daily', usagePeriods.daily],
+          ['Weekly', usagePeriods.weekly],
+          ['Monthly', usagePeriods.monthly],
+          ['All-time', usagePeriods.all_time],
+        ].map(([label, usage]) => (
+          <div key={label} className="card space-y-2">
+            <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+            <div className="text-lg font-semibold text-white">{formatUsd(usage?.total_cost_usd || 0)}</div>
+            {(usage?.unpriced_tokens || 0) > 0 && (
+              <div className="text-xs text-amber-300">{formatNum(usage.unpriced_tokens)} tokens unpriced</div>
+            )}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <span className="text-slate-500">Input</span>
+                <div className="text-slate-300">{formatNum(usage?.tokens_in || 0)}</div>
+              </div>
+              <div>
+                <span className="text-slate-500">Output</span>
+                <div className="text-slate-300">{formatNum(usage?.tokens_out || 0)}</div>
+              </div>
+            </div>
+            <div className="text-xs text-slate-600">
+              {formatNum(usage?.tokens_total || 0)} tokens / {usage?.requests || 0} req
+              {(usage?.priced_requests || 0) > 0 ? ` / ${usage.priced_requests} priced` : ''}
+            </div>
+          </div>
+        ))}
       </div>
 
       {logs.length === 0 ? (
@@ -58,6 +117,7 @@ export default function Logs() {
                 <th className="text-left py-2 px-2">Status</th>
                 <th className="text-left py-2 px-2">Latency</th>
                 <th className="text-left py-2 px-2">Tokens</th>
+                <th className="text-left py-2 px-2">Cost</th>
                 <th className="text-left py-2 px-2">Error</th>
                 <th className="text-left py-2 px-2">Fallback</th>
               </tr>
@@ -83,6 +143,14 @@ export default function Logs() {
                       <td className="py-2 px-2 text-xs text-slate-500">
                         {(l.tokens_in || l.tokens_out) ? `${l.tokens_in || 0}+${l.tokens_out || 0}` : '-'}
                       </td>
+                      <td className="py-2 px-2 text-xs text-slate-500">
+                        {l.pricing_source ? (
+                          <div>
+                            <div>{formatUsd(l.total_cost_usd)}</div>
+                            <div className="text-slate-600">{formatUsd(l.input_cost_usd || 0)}+{formatUsd(l.output_cost_usd || 0)}</div>
+                          </div>
+                        ) : <span className="text-amber-300">unpriced</span>}
+                      </td>
                       <td className="py-2 px-2 text-xs text-red-400 max-w-[250px] truncate">{l.error || '-'}</td>
                       <td className="py-2 px-2 text-xs">
                         {chain.length ? (
@@ -96,7 +164,7 @@ export default function Logs() {
                     </tr>
                     {isExpanded && chain.length > 0 && (
                       <tr key={`${l.id}-fallback`} className="border-b border-[#1e1e2e]/50 bg-black/20">
-                        <td colSpan={8} className="px-2 py-3">
+                        <td colSpan={9} className="px-2 py-3">
                           <div className="space-y-1">
                             {chain.map((item, idx) => (
                               <div key={idx} className="text-xs text-slate-300 font-mono">
@@ -118,4 +186,19 @@ export default function Logs() {
       )}
     </div>
   )
+}
+
+function formatUsd(value) {
+  const n = Number(value || 0)
+  if (!n) return '$0'
+  if (n < 0.0001) return `$${n.toFixed(6)}`
+  if (n < 0.01) return `$${n.toFixed(5)}`
+  return `$${n.toFixed(4)}`
+}
+
+function formatNum(n) {
+  const value = Number(n || 0)
+  if (value >= 1000000) return (value / 1000000).toFixed(1) + 'M'
+  if (value >= 1000) return (value / 1000).toFixed(1) + 'K'
+  return String(value)
 }

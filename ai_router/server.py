@@ -4,11 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import db, proxy, config
-import json
+import asyncio
+import logging
 import os
 import time
 
 app = FastAPI(title="AI Router", version="2.0.0")
+logger = logging.getLogger(__name__)
+pricing_sync_task = None
+PRICING_SYNC_INTERVAL = float(os.getenv("AI_ROUTER_PRICING_SYNC_INTERVAL", "60"))
 
 # CORS
 app.add_middleware(
@@ -85,15 +89,37 @@ async def protect_management_api(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup():
+    global pricing_sync_task
     await db.get_db()
+    if PRICING_SYNC_INTERVAL > 0:
+        pricing_sync_task = asyncio.create_task(pricing_sync_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    global pricing_sync_task
+    if pricing_sync_task:
+        pricing_sync_task.cancel()
+        try:
+            await pricing_sync_task
+        except asyncio.CancelledError:
+            pass
+        pricing_sync_task = None
     await db.close_db()
 
 
-# ============ PROXY ENDPOINTS (OpenAI-compatible) ============
+async def pricing_sync_loop():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            result = await db.sync_openrouter_pricing()
+            logger.info("Pricing catalog sync complete: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Pricing catalog sync failed; keeping previous prices: %s", e)
+        await asyncio.sleep(PRICING_SYNC_INTERVAL)
+
 
 @app.get("/v1/health")
 async def v1_health():
@@ -442,7 +468,29 @@ async def api_get_stats():
     return await db.get_stats()
 
 
-# --- Settings ---
+@app.get("/api/pricing")
+async def api_list_pricing(limit: int = 500):
+    return await db.list_model_pricing(limit)
+
+
+@app.post("/api/pricing/sync-openrouter")
+async def api_sync_openrouter_pricing():
+    try:
+        return await db.sync_openrouter_pricing()
+    except Exception as e:
+        raise HTTPException(502, f"Pricing sync failed: {str(e)[:300]}")
+
+
+@app.put("/api/pricing/{model_id:path}")
+async def api_upsert_pricing(model_id: str, request: Request):
+    data = await request.json()
+    return await db.upsert_model_pricing(
+        model_id,
+        data.get("input_per_million", 0),
+        data.get("output_per_million", 0),
+        data.get("source", "manual"),
+    )
+
 
 @app.get("/api/settings")
 async def api_get_settings():
