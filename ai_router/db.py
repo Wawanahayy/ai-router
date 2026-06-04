@@ -132,28 +132,28 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('strategy', 'round-robin');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('require_login', 'true');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('require_login', 'false');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('login_password', 'ABC12345');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('require_api_key', 'true');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('rtk_enabled', 'false');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('rr_counter', '0');
 """
 
+# Provider presets - shown to user as templates when adding new providers
 PROVIDER_PRESETS = [
-    {"name": "Custom OpenAI Compatible", "type": "openai-compatible", "base_url": "https://example.com/v1", "prefix": "custom", "prefix_enabled": 0, "auth_type": "bearer", "chat_path": "/chat/completions", "models_path": "/models"},
-    {"name": "Custom Claude / Anthropic Compatible", "type": "anthropic-compatible", "base_url": "https://example.com/v1", "prefix": "custom-claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "anthropic_version": "2023-06-01"},
-    {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "models_path": "", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 1, "supports_json_mode": 1, "anthropic_version": "2023-06-01"},
-    {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 0},
-    {"name": "Anthropic (Claude)", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "claude", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages"},
-    {"name": "NVIDIA NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 0},
-    {"name": "Groq", "type": "openai-compatible", "base_url": "https://api.groq.com/openai/v1", "prefix": "groq", "prefix_enabled": 0},
-    {"name": "OpenRouter", "type": "openai-compatible", "base_url": "https://openrouter.ai/api/v1", "prefix": "openrouter", "prefix_enabled": 0},
-    {"name": "Mimo", "type": "openai-compatible", "base_url": "https://api.mimo.company/v1", "prefix": "mimo", "prefix_enabled": 0},
- {"name": "NovAI", "type": "openai-compatible", "base_url": "https://aiapi-pro.com/v1", "prefix": "novai", "prefix_enabled": 0},
- {"name": "Google Gemini", "type": "openai-compatible", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "prefix": "gemini", "prefix_enabled": 0},
-    {"name": "DeepSeek", "type": "openai-compatible", "base_url": "https://api.deepseek.com/v1", "prefix": "deepseek", "prefix_enabled": 0},
-    {"name": "Together AI", "type": "openai-compatible", "base_url": "https://api.together.xyz/v1", "prefix": "together", "prefix_enabled": 0},
-    {"name": "Fireworks AI", "type": "openai-compatible", "base_url": "https://api.fireworks.ai/inference/v1", "prefix": "fireworks", "prefix_enabled": 0},
+    {"name": "Custom OpenAI Compatible", "type": "openai-compatible", "base_url": "https://example.com/v1", "prefix": "custom", "prefix_enabled": 1, "auth_type": "bearer", "chat_path": "/chat/completions", "models_path": "/models"},
+    {"name": "Custom Anthropic Compatible", "type": "anthropic-compatible", "base_url": "https://example.com/v1", "prefix": "custom-claude", "prefix_enabled": 1, "auth_type": "x-api-key", "chat_path": "/messages", "anthropic_version": "2023-06-01"},
+    {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 1},
+    {"name": "Anthropic (Claude)", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "claude", "prefix_enabled": 1, "auth_type": "x-api-key", "chat_path": "/messages"},
+    {"name": "NVIDIA NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 1},
+    {"name": "Groq", "type": "openai-compatible", "base_url": "https://api.groq.com/openai/v1", "prefix": "groq", "prefix_enabled": 1},
+    {"name": "OpenRouter", "type": "openai-compatible", "base_url": "https://openrouter.ai/api/v1", "prefix": "openrouter", "prefix_enabled": 1},
+    {"name": "Mimo", "type": "openai-compatible", "base_url": "https://api.mimo.company/v1", "prefix": "mimo", "prefix_enabled": 1},
+ {"name": "NovAI", "type": "openai-compatible", "base_url": "https://aiapi-pro.com/v1", "prefix": "novai", "prefix_enabled": 1},
+ {"name": "Google Gemini", "type": "openai-compatible", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "prefix": "gemini", "prefix_enabled": 1},
+    {"name": "DeepSeek", "type": "openai-compatible", "base_url": "https://api.deepseek.com/v1", "prefix": "deepseek", "prefix_enabled": 1},
+    {"name": "Together AI", "type": "openai-compatible", "base_url": "https://api.together.xyz/v1", "prefix": "together", "prefix_enabled": 1},
+    {"name": "Fireworks AI", "type": "openai-compatible", "base_url": "https://api.fireworks.ai/inference/v1", "prefix": "fireworks", "prefix_enabled": 1},
 ]
 
 _db = None
@@ -219,7 +219,6 @@ async def get_db() -> aiosqlite.Connection:
                 "UPDATE settings SET value=? WHERE key='login_password' AND (value IS NULL OR value='')",
                 (config.AUTH_PASSWORD,),
             )
-        await _db.execute("UPDATE providers SET supports_tools=1, supports_streaming=1 WHERE type='claude-cli'")
         await _db.commit()
     return _db
 
@@ -230,6 +229,8 @@ async def close_db():
         await _db.close()
         _db = None
 
+
+# --- Provider Presets ---
 
 def get_provider_presets():
     """Return list of provider presets (templates for user to add)."""
@@ -242,28 +243,23 @@ def _normalize_provider_data(data: dict, existing: dict | None = None) -> dict:
     merged.update(data or {})
 
     provider_type = (merged.get("type") or "openai-compatible").strip()
-    if provider_type not in ("openai-compatible", "anthropic-compatible", "claude-cli"):
-        raise ValueError("Provider type must be openai-compatible, anthropic-compatible, or claude-cli")
+    if provider_type not in ("openai-compatible", "anthropic-compatible"):
+        raise ValueError("Provider type must be openai-compatible or anthropic-compatible")
     merged["type"] = provider_type
 
     request_format = (merged.get("request_format") or "").strip()
     if request_format and request_format not in ("openai-compatible", "anthropic-compatible"):
         raise ValueError("Request format must be openai-compatible or anthropic-compatible")
-    if provider_type == "claude-cli":
-        request_format = "anthropic-compatible"
     merged["request_format"] = request_format
 
-    effective_format = request_format or ("anthropic-compatible" if provider_type == "claude-cli" else provider_type)
+    effective_format = request_format or provider_type
     merged["base_url"] = (merged.get("base_url") or "").strip().rstrip("/")
     merged["prefix"] = (merged.get("prefix") or "").strip()
-    merged["prefix_enabled"] = int(merged.get("prefix_enabled", 0))
+    merged["prefix_enabled"] = int(merged.get("prefix_enabled", 1 if merged["prefix"] else 0))
     merged["api_type"] = merged.get("api_type") or "chat"
     merged["supports_tools"] = int(merged.get("supports_tools", 1))
     merged["supports_streaming"] = int(merged.get("supports_streaming", 1))
     merged["supports_json_mode"] = int(merged.get("supports_json_mode", 1))
-    if provider_type == "claude-cli":
-        merged["supports_tools"] = 1
-        merged["supports_streaming"] = 1
     merged["anthropic_version"] = merged.get("anthropic_version") or "2023-06-01"
     extra_headers = merged.get("extra_headers") or {}
     if isinstance(extra_headers, str):
@@ -284,6 +280,8 @@ def _normalize_provider_data(data: dict, existing: dict | None = None) -> dict:
 
     return merged
 
+
+# --- Provider CRUD ---
 
 async def list_providers():
     db = await get_db()
@@ -322,7 +320,7 @@ async def create_provider(data: dict):
     data = _normalize_provider_data(data)
     provider_id = data.get("id") or f"{data.get('type', 'openai-compatible')}-{uuid.uuid4()}"
     prefix = data.get("prefix", "").strip()
-    prefix_enabled = 0
+    prefix_enabled = 1 if prefix else 0
     if "prefix_enabled" in data:
         prefix_enabled = int(data["prefix_enabled"])
     await db.execute(
@@ -373,6 +371,8 @@ async def delete_provider(provider_id: str):
     await db.execute("DELETE FROM providers WHERE id=?", (provider_id,))
     await db.commit()
 
+
+# --- API Key CRUD ---
 
 AUTO_KEY_NAME_RE = re.compile(r"^apikey-(\d+)$")
 
@@ -471,6 +471,8 @@ async def delete_key(key_id: str):
     await db.commit()
 
 
+# --- Key Selection (round-robin) ---
+
 async def get_alive_key(provider_id: str, model: str = None):
     keys = await list_alive_keys(provider_id, model=model)
     return keys[0] if keys else None
@@ -485,12 +487,14 @@ async def list_alive_keys(provider_id: str, advance: bool = True, model: str = N
     """Return all alive keys for a provider, rotated from the current RR position."""
     db = await get_db()
     now = datetime_utc_now()
+    # Auto-recover cooldown keys whose cooldown has expired
     await db.execute(
         "UPDATE api_keys SET status='alive', cooldown_until=NULL WHERE provider_id=? AND status='cooldown' AND cooldown_until IS NOT NULL AND cooldown_until < ?",
         (provider_id, now)
     )
     await db.execute("DELETE FROM key_model_locks WHERE locked_until < ?", (now,))
     await db.commit()
+    # Get alive keys ordered by last_used (round-robin: least recently used first)
     if model:
         cursor = await db.execute(
             """
@@ -512,6 +516,7 @@ async def list_alive_keys(provider_id: str, advance: bool = True, model: str = N
     keys = [dict(r) for r in await cursor.fetchall()]
     if not keys:
         return []
+    # Rotate the returned list so fallback tries every key, but starts fairly.
     rr = await _get_rr(f"key_rr_{provider_id}")
     start = rr % len(keys)
     ordered = keys[start:] + keys[:start]
@@ -616,6 +621,8 @@ async def clear_key_model_lock(key_id: str, model: str):
     await db.commit()
 
 
+# --- Round-Robin Helpers ---
+
 async def _get_rr(key: str) -> int:
     db = await get_db()
     cursor = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
@@ -640,6 +647,8 @@ async def increment_rr_counter() -> int:
     await _set_rr("rr_counter", nxt)
     return cur
 
+
+# --- Local API Keys (user self-managed) ---
 
 async def list_local_keys():
     db = await get_db()
@@ -713,6 +722,8 @@ async def mark_local_key_used(key_id: str, tokens: int = 0):
     await db.commit()
 
 
+# --- Model Aliases ---
+
 async def list_aliases(provider_id: str = None):
     db = await get_db()
     if provider_id:
@@ -768,6 +779,8 @@ async def get_alias(alias: str):
     return None
 
 
+# --- Combos CRUD ---
+
 async def list_combos():
     db = await get_db()
     cursor = await db.execute("""
@@ -776,6 +789,7 @@ async def list_combos():
         FROM combos c ORDER BY c.created_at DESC
     """)
     combos = [dict(r) for r in await cursor.fetchall()]
+    # Load models for each combo
     for combo in combos:
         cur2 = await db.execute("""
             SELECT cm.*, p.name as provider_name, p.type as provider_type, p.base_url as provider_base_url
@@ -815,6 +829,7 @@ async def create_combo(data: dict):
         (combo_id, name, data.get("description", ""), 1)
     )
     await db.commit()
+    # Add models if provided
     for m in data.get("models", []):
         mid = str(uuid.uuid4())
         await db.execute(
@@ -910,6 +925,7 @@ async def combo_exists(combo_name: str):
 async def resolve_combo_candidates(combo_name: str):
     """Return combo model candidates in fallback order."""
     db = await get_db()
+    # Find combo by name
     cursor = await db.execute("SELECT * FROM combos WHERE LOWER(name)=LOWER(?) AND is_active=1", (combo_name,))
     row = await cursor.fetchone()
     if not row:
@@ -917,6 +933,7 @@ async def resolve_combo_candidates(combo_name: str):
     combo = dict(row)
     combo_id = combo["id"]
     
+    # Get active models for this combo
     cursor = await db.execute("""
         SELECT cm.*, p.is_active as provider_active
         FROM combo_models cm
@@ -929,6 +946,7 @@ async def resolve_combo_candidates(combo_name: str):
     if not models:
         return []
     
+    # Filter to only models whose provider is active and has alive keys
     available = []
     for m in models:
         if not m.get("provider_active", 0):
@@ -939,9 +957,11 @@ async def resolve_combo_candidates(combo_name: str):
     if not available:
         return []
     
+    # Select model based on combo mode (round_robin or single)
     if combo.get("mode", "round_robin") == "single":
         return available
 
+    # Round-robin mode: rotate fallback order through available models.
     rr = await _get_rr(f"combo_rr_{combo_id}")
     start = rr % len(available)
     ordered = available[start:] + available[:start]
@@ -1196,6 +1216,8 @@ async def get_stats():
         "active_combos": active_combos,
     }
 
+
+# --- Settings ---
 
 async def get_setting(key: str):
     db = await get_db()

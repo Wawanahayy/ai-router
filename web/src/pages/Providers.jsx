@@ -280,11 +280,9 @@ export default function Providers() {
     setFormModels(formModels.filter(x => x !== m))
   }
 
-  const providerTypeHelp = formType === 'claude-cli'
-    ? 'Runs the local Claude CLI as an upstream provider. Base URL, API key, and model are passed to the CLI internally; models can be used directly or inside combos. Streaming and tools are disabled for this provider type.'
-    : formType === 'anthropic-compatible'
-      ? 'Use this for official Anthropic or Claude-compatible third-party APIs. Add its base URL, API key, and models here; those models can be used directly or inside combos.'
-      : 'OpenAI-compatible upstream defaults to /chat/completions and /models. OpenAI-compatible clients call /v1/chat/completions.'
+  const providerTypeHelp = formType === 'anthropic-compatible'
+    ? 'Anthropic-compatible upstream defaults to /messages. Anthropic clients can call /v1/messages; OpenAI clients can call /v1/chat/completions and ai-router will convert.'
+    : 'OpenAI-compatible upstream defaults to /chat/completions and /models. OpenAI-compatible clients call /v1/chat/completions.'
 
   if (loading) return <div className="text-slate-500">Loading...</div>
 
@@ -325,8 +323,7 @@ export default function Providers() {
  <select name="type" className="input" required value={formType} onChange={e => setFormType(e.target.value)}>
  <option value="">-- Select type --</option>
  <option value="openai-compatible">OpenAI Compatible</option>
- <option value="anthropic-compatible">Claude / Anthropic Compatible</option>
- <option value="claude-cli">Claude CLI</option>
+ <option value="anthropic-compatible">Anthropic Compatible</option>
  </select>
  </div>
  <div className="col-span-2 text-xs text-slate-500 bg-white/[0.035] border border-white/[0.06] rounded-lg px-3 py-2">
@@ -334,7 +331,7 @@ export default function Providers() {
  </div>
             <div>
               <label className="text-xs text-slate-500">Base URL *</label>
-              <input name="base_url" className="input" placeholder={formType === 'claude-cli' ? 'https://api.anthropic.com/v1' : 'https://integrate.api.nvidia.com/v1'} required />
+              <input name="base_url" className="input" placeholder="https://integrate.api.nvidia.com/v1" required />
             </div>
             <div className="flex items-end gap-2">
               <div className="flex-1">
@@ -358,8 +355,8 @@ export default function Providers() {
               </select>
             </div>
             <div>
-              <label className="text-xs text-slate-500">{formType === 'claude-cli' ? 'Extra Env (JSON)' : 'Extra Headers (JSON)'}</label>
-              <input name="extra_headers" className="input" placeholder={formType === 'claude-cli' ? '{"ANTHROPIC_SMALL_FAST_MODEL":"claude-3-5-haiku-latest"}' : '{"X-Custom":"val"}'} />
+              <label className="text-xs text-slate-500">Extra Headers (JSON)</label>
+              <input name="extra_headers" className="input" placeholder='{"X-Custom":"val"}' />
             </div>
             <div>
               <label className="text-xs text-slate-500">Auth Type</label>
@@ -387,11 +384,11 @@ export default function Providers() {
             </div>
             <div>
               <label className="text-xs text-slate-500">Chat Path</label>
-              <input name="chat_path" className="input" placeholder={formType === 'anthropic-compatible' || formType === 'claude-cli' ? '/messages' : '/chat/completions'} />
+              <input name="chat_path" className="input" placeholder={formType === 'anthropic-compatible' ? '/messages' : '/chat/completions'} />
             </div>
             <div>
               <label className="text-xs text-slate-500">Models Path</label>
-              <input name="models_path" className="input" placeholder={formType === 'anthropic-compatible' || formType === 'claude-cli' ? 'optional' : '/models'} />
+              <input name="models_path" className="input" placeholder={formType === 'anthropic-compatible' ? 'optional' : '/models'} />
             </div>
             <div>
               <label className="text-xs text-slate-500">Request Format</label>
@@ -541,8 +538,7 @@ export default function Providers() {
                             <label className="text-xs text-slate-500">Type *</label>
                             <select name="type" className="input" value={editType} onChange={e => setEditType(e.target.value)} required>
                               <option value="openai-compatible">OpenAI Compatible</option>
-                              <option value="anthropic-compatible">Claude / Anthropic Compatible</option>
-                              <option value="claude-cli">Claude CLI</option>
+                              <option value="anthropic-compatible">Anthropic Compatible</option>
                             </select>
                           </div>
                           <div>
@@ -571,12 +567,12 @@ export default function Providers() {
                             </select>
                           </div>
                           <div>
-                            <label className="text-xs text-slate-500">{editType === 'claude-cli' ? 'Extra Env (JSON)' : 'Extra Headers (JSON)'}</label>
+                            <label className="text-xs text-slate-500">Extra Headers (JSON)</label>
                             <input
                               name="extra_headers"
                               className="input"
                               defaultValue={typeof p.extra_headers === 'string' ? p.extra_headers : JSON.stringify(p.extra_headers || {})}
-                              placeholder={editType === 'claude-cli' ? '{"ANTHROPIC_SMALL_FAST_MODEL":"claude-3-5-haiku-latest"}' : '{"X-Custom":"val"}'}
+                              placeholder='{"X-Custom":"val"}'
                             />
                           </div>
                           <div>
@@ -605,11 +601,11 @@ export default function Providers() {
                           </div>
                           <div>
                             <label className="text-xs text-slate-500">Chat Path</label>
-                            <input name="chat_path" className="input" defaultValue={p.chat_path || ''} placeholder={editType === 'anthropic-compatible' || editType === 'claude-cli' ? '/messages' : '/chat/completions'} />
+                            <input name="chat_path" className="input" defaultValue={p.chat_path || ''} placeholder={editType === 'anthropic-compatible' ? '/messages' : '/chat/completions'} />
                           </div>
                           <div>
                             <label className="text-xs text-slate-500">Models Path</label>
-                            <input name="models_path" className="input" defaultValue={p.models_path || ''} placeholder={editType === 'anthropic-compatible' || editType === 'claude-cli' ? 'optional' : '/models'} />
+                            <input name="models_path" className="input" defaultValue={p.models_path || ''} placeholder={editType === 'anthropic-compatible' ? 'optional' : '/models'} />
                           </div>
                           <div>
                             <label className="text-xs text-slate-500">Request Format</label>

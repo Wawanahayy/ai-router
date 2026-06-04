@@ -12,7 +12,7 @@ usage() {
 AI Router helper script
 
 Usage:
-  bash start.sh setup       Create Python venv, install backend deps, create .env, install Claude Code CLI when possible
+  bash start.sh setup       Create Python venv, install backend deps, create .env
   bash start.sh run         Run the backend server
   bash start.sh build-web   Install dashboard deps and build static files
   bash start.sh dev-web     Run dashboard dev server
@@ -52,126 +52,6 @@ venv_python() {
   fi
 }
 
-detect_claude_cli() {
-  if command -v claude >/dev/null 2>&1; then
-    command -v claude
-    return 0
-  fi
-
-  if command -v npm >/dev/null 2>&1; then
-    local npm_prefix npm_root
-    npm_prefix="$(npm config get prefix 2>/dev/null || true)"
-    npm_root="$(npm root -g 2>/dev/null || true)"
-
-    local candidates=(
-      "${npm_prefix}/bin/claude"
-      "${npm_root}/@anthropic-ai/claude-code/bin/claude"
-      "${npm_root}/@anthropic-ai/claude-code/bin/claude.exe"
-      "${npm_root}/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude"
-      "${HOME}/.local/bin/claude"
-      "${HOME}/.npm-global/bin/claude"
-      "${HOME}/.hermes/node/bin/claude"
-      "/usr/local/bin/claude"
-      "/usr/bin/claude"
-    )
-
-    local candidate
-    for candidate in "${candidates[@]}"; do
-      if [ -x "${candidate}" ]; then
-        echo "${candidate}"
-        return 0
-      fi
-    done
-  fi
-
-  local search_dir found
-  for search_dir in ${CLAUDE_CLI_SEARCH_DIRS:-"${HOME} /usr/local /opt"}; do
-    if [ -d "${search_dir}" ]; then
-      found="$(find "${search_dir}" -type f -name claude -perm -111 2>/dev/null | head -n 1 || true)"
-      if [ -n "${found}" ]; then
-        echo "${found}"
-        return 0
-      fi
-    fi
-  done
-
-  return 1
-}
-
-set_env_value() {
-  local file="$1"
-  local key="$2"
-  local value="$3"
-  local tmp="${file}.tmp.$$"
-
-  if [ ! -f "${file}" ]; then
-    touch "${file}"
-  fi
-
-  if grep -q "^${key}=" "${file}"; then
-    while IFS= read -r line || [ -n "${line}" ]; do
-      case "${line}" in
-        "${key}="*) printf '%s=%s\n' "${key}" "${value}" ;;
-        *) printf '%s\n' "${line}" ;;
-      esac
-    done < "${file}" > "${tmp}"
-    mv "${tmp}" "${file}"
-  else
-    printf '\n%s=%s\n' "${key}" "${value}" >> "${file}"
-  fi
-}
-
-ensure_claude_global_command() {
-  local claude_bin="$1"
-  local claude_dir
-  claude_dir="$(dirname "${claude_bin}")"
-
-  if command -v claude >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
-    ln -sf "${claude_bin}" "/usr/local/bin/claude"
-    echo "Linked Claude Code CLI to /usr/local/bin/claude"
-  elif [ -d "/usr/local/bin" ] && command -v sudo >/dev/null 2>&1; then
-    if sudo ln -sf "${claude_bin}" "/usr/local/bin/claude"; then
-      echo "Linked Claude Code CLI to /usr/local/bin/claude"
-    fi
-  fi
-
-  if command -v claude >/dev/null 2>&1; then
-    return 0
-  fi
-
-  case ":${PATH}:" in
-    *":${claude_dir}:"*) return 0 ;;
-  esac
-
-  export PATH="${claude_dir}:${PATH}"
-  if [ -f "${HOME}/.bashrc" ]; then
-    if ! grep -Fq "${claude_dir}" "${HOME}/.bashrc"; then
-      printf '\nexport PATH="%s:$PATH"\n' "${claude_dir}" >> "${HOME}/.bashrc"
-      echo "Added ${claude_dir} to ~/.bashrc PATH"
-    fi
-  else
-    printf 'export PATH="%s:$PATH"\n' "${claude_dir}" > "${HOME}/.bashrc"
-    echo "Created ~/.bashrc with Claude Code CLI PATH"
-  fi
-}
-
-configure_claude_cli() {
-  local claude_bin
-  if claude_bin="$(detect_claude_cli)"; then
-    echo "Claude Code CLI detected: ${claude_bin}"
-    ensure_claude_global_command "${claude_bin}"
-    set_env_value ".env" "AI_ROUTER_CLAUDE_CLI_BINARY" "${claude_bin}"
-    echo "Configured AI_ROUTER_CLAUDE_CLI_BINARY in .env"
-  else
-    echo "Claude Code CLI binary was not detected." >&2
-    echo "If it is installed outside PATH, set AI_ROUTER_CLAUDE_CLI_BINARY=/path/to/claude in .env" >&2
-  fi
-}
-
 cmd_setup() {
   ensure_venv
   local py
@@ -185,21 +65,6 @@ cmd_setup() {
     echo "Created .env from .env.example"
   else
     echo ".env already exists, leaving it unchanged"
-  fi
-
-  if detect_claude_cli >/dev/null 2>&1; then
-    configure_claude_cli
-  elif command -v npm >/dev/null 2>&1; then
-    echo "Installing Claude Code CLI..."
-    if npm install -g @anthropic-ai/claude-code; then
-      configure_claude_cli
-    else
-      echo "Claude Code CLI install failed. You can retry manually:" >&2
-      echo "  npm install -g @anthropic-ai/claude-code" >&2
-    fi
-  else
-    echo "npm not found; skipping Claude Code CLI install." >&2
-    echo "Install Node.js/npm, then run: npm install -g @anthropic-ai/claude-code" >&2
   fi
 
   mkdir -p data
@@ -271,11 +136,6 @@ cmd_check() {
     npm --version
   else
     echo "npm: not found"
-  fi
-  if detect_claude_cli >/dev/null 2>&1; then
-    echo "claude: $(detect_claude_cli)"
-  else
-    echo "claude: not found"
   fi
   echo "Endpoint: http://localhost:32128"
 }

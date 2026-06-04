@@ -8,8 +8,6 @@ logger = logging.getLogger(__name__)
 
 def provider_format(provider: dict) -> str:
     """Return the request/response format handled by the router."""
-    if provider.get("type") == "claude-cli":
-        return provider.get("request_format") or "anthropic-compatible"
     return provider.get("request_format") or provider.get("type") or "openai-compatible"
 
 

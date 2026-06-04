@@ -1,8 +1,8 @@
 """AI Router FastAPI main server."""
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import db, proxy, config
 import asyncio
 import logging
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 pricing_sync_task = None
 PRICING_SYNC_INTERVAL = float(os.getenv("AI_ROUTER_PRICING_SYNC_INTERVAL", "60"))
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,6 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# --- Auth helpers ---
 
 async def dashboard_auth_config():
     require_login = await db.get_setting("require_login")
@@ -44,9 +47,15 @@ async def check_dashboard_auth(request: Request):
 
 
 async def check_proxy_auth(request: Request):
+    """
+    Check auth for proxy endpoints (/v1/*).
+    1. If require_api_key setting is true: must provide a valid local API key
+    2. If require_api_key is false: allow any request through
+    3. Dashboard auth (AUTH_PASSWORD) also works as fallback
+    """
     require_api_key = await db.get_setting("require_api_key")
     if require_api_key != "true":
-        return None
+        return None  # No auth needed
 
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -54,10 +63,12 @@ async def check_proxy_auth(request: Request):
 
     token = auth[7:].strip()
     
+    # Check local API key
     local_key = await db.get_local_key(token)
     if local_key:
         return local_key["id"]
 
+    # Fallback: dashboard password also works
     auth_enabled, dashboard_password = await dashboard_auth_config()
     if auth_enabled and token == dashboard_password:
         return None
@@ -121,7 +132,7 @@ async def chat_completions(request: Request):
     result, status = await proxy.proxy_chat_completions(body, dict(request.headers), local_key_id)
     if isinstance(result, dict) and "error" in result:
         return JSONResponse(result, status_code=status)
-    if hasattr(result, '__call__'):
+    if hasattr(result, '__call__'):  # SSE response
         return result
     return JSONResponse(result, status_code=status)
 
@@ -138,14 +149,6 @@ async def anthropic_messages(request: Request):
     return JSONResponse(result, status_code=status)
 
 
-@app.post("/v1/messages/count_tokens")
-async def anthropic_count_tokens(request: Request):
-    await check_proxy_auth(request)
-    body = await request.json()
-    result, status = await proxy.proxy_anthropic_count_tokens(body)
-    return JSONResponse(result, status_code=status)
-
-
 @app.get("/v1/models")
 async def list_models(request: Request):
     await check_proxy_auth(request)
@@ -159,6 +162,8 @@ async def list_models_post(request: Request):
     result, status = await proxy.proxy_models()
     return JSONResponse(result, status_code=status)
 
+
+# ============ MANAGEMENT API ============
 
 @app.get("/api/health")
 async def api_health():
@@ -204,6 +209,8 @@ async def api_auth_logout():
     response.delete_cookie("ai_router_token")
     return response
 
+# --- Providers ---
+
 @app.get("/api/providers")
 async def api_list_providers():
     return await db.list_providers()
@@ -221,6 +228,7 @@ async def api_create_provider(request: Request):
     except ValueError as e:
         raise HTTPException(400, str(e))
     proxy.invalidate_models_cache()
+    # Auto-discover models from upstream if keys provided
     models_to_add = data.get("models", [])
     if models_to_add:
         effective_prefix = ""
@@ -325,6 +333,8 @@ async def api_delete_provider_models(provider_id: str):
     return {"ok": True, "deleted": deleted}
 
 
+# --- Keys ---
+
 @app.get("/api/keys")
 async def api_list_keys(provider_id: str = None, status: str = None):
     return await db.list_keys(provider_id, status)
@@ -378,6 +388,8 @@ async def api_deactivate_key(key_id: str):
     return {"ok": True}
 
 
+# --- Local API Keys (our own keys for external users) ---
+
 @app.get("/api/local-keys")
 async def api_list_local_keys():
     return await db.list_local_keys()
@@ -387,7 +399,7 @@ async def api_list_local_keys():
 async def api_create_local_key(request: Request):
     data = await request.json()
     name = data.get("name", "")
-    key_value = data.get("key", None)
+    key_value = data.get("key", None)  # Optional: provide custom key
     result = await db.create_local_key(name, key_value)
     return result
 
@@ -404,6 +416,8 @@ async def api_toggle_local_key(key_id: str, request: Request):
     await db.toggle_local_key(key_id, data.get("is_active", 1))
     return {"ok": True}
 
+
+# --- Aliases / Models ---
 
 @app.get("/api/aliases")
 async def api_list_aliases(provider_id: str = None):
@@ -440,10 +454,14 @@ async def api_deactivate_alias(request: Request):
     return {"ok": True}
 
 
+# --- Logs ---
+
 @app.get("/api/logs")
 async def api_get_logs(limit: int = 100, provider_id: str = None):
     return await db.get_logs(limit, provider_id)
 
+
+# --- Stats ---
 
 @app.get("/api/stats")
 async def api_get_stats():
@@ -487,6 +505,8 @@ async def api_set_settings(request: Request):
     return {"ok": True}
 
 
+# --- Local API Keys (update) ---
+
 @app.put("/api/local-keys/{key_id}")
 async def api_update_local_key(key_id: str, request: Request):
     data = await request.json()
@@ -495,6 +515,8 @@ async def api_update_local_key(key_id: str, request: Request):
         raise HTTPException(404, "Local key not found")
     return result
 
+
+# --- Combos CRUD ---
 
 @app.get("/api/combos")
 async def api_list_combos():
@@ -559,6 +581,8 @@ async def api_update_combo_model(combo_id: str, model_id: str, request: Request)
     await db.update_combo_model(model_id, data)
     return {"ok": True}
 
+
+# ============ STATIC FILES (React frontend) ============
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(STATIC_DIR):

@@ -17,7 +17,6 @@ web dashboard.
 
 - OpenAI-compatible endpoint: `/v1/chat/completions`
 - Anthropic Messages-compatible endpoint: `/v1/messages`
-- Anthropic token counting endpoint: `/v1/messages/count_tokens`
 - Custom OpenAI-compatible and Anthropic-compatible upstream providers
 - Multiple upstream API keys per provider
 - Provider/model aliases and combo routing
@@ -49,7 +48,6 @@ local `ar-...` API key when proxy API key protection is enabled.
 
 - Python 3.11+
 - Node.js 20+ for building the dashboard
-- npm for installing Claude Code CLI during setup
 
 ## Quick Start
 
@@ -66,16 +64,6 @@ Using the helper script:
 bash start.sh setup
 bash start.sh run
 ```
-
-`bash start.sh setup` installs Python dependencies and tries to install Claude
-Code CLI with:
-
-```bash
-npm install -g @anthropic-ai/claude-code
-```
-
-If npm is not available or the global install needs different permissions, the
-router setup still completes and the script prints the manual install command.
 
 Manual setup:
 
@@ -99,7 +87,7 @@ Open the dashboard in your browser:
 http://localhost:32128
 ```
 
-Dashboard login is enabled by default. The default dashboard password is:
+The default dashboard password is:
 
 ```text
 ABC12345
@@ -151,30 +139,6 @@ Authorization: Bearer ar-your-local-key
 anthropic-version: 2023-06-01
 ```
 
-## Claude CLI Provider
-
-Claude-compatible upstream APIs are added from the Providers page like any
-other provider. Choose `Claude / Anthropic Compatible` for direct HTTP APIs, or
-choose `Claude CLI` when you want AI Router to run the local Claude Code CLI as
-the upstream adapter.
-
-For `Claude CLI`, enter the provider base URL, upstream API key, and model IDs
-the same way as other providers. Requests still go to AI Router's local
-OpenAI-compatible or Anthropic-compatible endpoints. AI Router then passes the
-provider settings to the local `claude` command internally and returns a normal
-API response. Those models can also be used inside combos and fallback chains.
-
-Claude Code CLI is installed by `bash start.sh setup` when npm is available.
-If it is missing, install it manually:
-
-```bash
-npm install -g @anthropic-ai/claude-code
-```
-
-Current `Claude CLI` provider support is non-streaming and text-response
-focused. Tool calling is disabled for that provider type so requests can fail
-clearly or fall back to another provider.
-
 ## Example Requests
 
 OpenAI-compatible chat completions:
@@ -213,7 +177,7 @@ curl http://localhost:32128/v1/messages \
 
 AI Router separates routing into a few parts:
 
-- Providers are upstream services, such as OpenAI-compatible APIs, Anthropic-compatible APIs, Claude CLI adapters, or custom providers.
+- Providers are upstream services, such as OpenAI-compatible APIs, Anthropic-compatible APIs, or custom providers.
 - Keys are upstream provider API keys. One provider can have many keys.
 - Empty key labels are automatically named `apikey-1`, `apikey-2`, and so on.
 - Models are provider model IDs or local aliases that your client can request.

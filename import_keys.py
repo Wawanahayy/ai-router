@@ -16,16 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 PROVIDER_PRESETS = {
-    "novai": {"name": "NovAI", "type": "openai-compatible", "base_url": "https://aiapi-pro.com/v1", "prefix": "novai", "prefix_enabled": 0},
-    "openai": {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 0},
-    "anthropic": {"name": "Anthropic", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "anthropic", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages"},
-    "claude-cli": {"name": "Claude CLI Provider", "type": "claude-cli", "base_url": "https://api.anthropic.com/v1", "prefix": "claude-cli", "prefix_enabled": 0, "auth_type": "x-api-key", "chat_path": "/messages", "request_format": "anthropic-compatible", "supports_tools": 1, "supports_streaming": 1},
-    "nvidia": {"name": "Nvidia NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 0},
-    "openrouter": {"name": "OpenRouter", "type": "openai-compatible", "base_url": "https://openrouter.ai/api/v1", "prefix": "openrouter", "prefix_enabled": 0},
-    "groq": {"name": "Groq", "type": "openai-compatible", "base_url": "https://api.groq.com/openai/v1", "prefix": "groq", "prefix_enabled": 0},
-    "deepseek": {"name": "DeepSeek", "type": "openai-compatible", "base_url": "https://api.deepseek.com/v1", "prefix": "deepseek", "prefix_enabled": 0},
-    "together": {"name": "Together AI", "type": "openai-compatible", "base_url": "https://api.together.xyz/v1", "prefix": "together", "prefix_enabled": 0},
-    "fireworks": {"name": "Fireworks AI", "type": "openai-compatible", "base_url": "https://api.fireworks.ai/inference/v1", "prefix": "fireworks", "prefix_enabled": 0},
+    "novai": {"name": "NovAI", "type": "openai-compatible", "base_url": "https://aiapi-pro.com/v1", "prefix": "novai", "prefix_enabled": 1},
+    "openai": {"name": "OpenAI", "type": "openai-compatible", "base_url": "https://api.openai.com/v1", "prefix": "openai", "prefix_enabled": 1},
+    "anthropic": {"name": "Anthropic", "type": "anthropic-compatible", "base_url": "https://api.anthropic.com/v1", "prefix": "anthropic", "prefix_enabled": 1, "auth_type": "x-api-key", "chat_path": "/messages"},
+    "nvidia": {"name": "Nvidia NIM", "type": "openai-compatible", "base_url": "https://integrate.api.nvidia.com/v1", "prefix": "nvidia", "prefix_enabled": 1},
+    "openrouter": {"name": "OpenRouter", "type": "openai-compatible", "base_url": "https://openrouter.ai/api/v1", "prefix": "openrouter", "prefix_enabled": 1},
+    "groq": {"name": "Groq", "type": "openai-compatible", "base_url": "https://api.groq.com/openai/v1", "prefix": "groq", "prefix_enabled": 1},
+    "deepseek": {"name": "DeepSeek", "type": "openai-compatible", "base_url": "https://api.deepseek.com/v1", "prefix": "deepseek", "prefix_enabled": 1},
+    "together": {"name": "Together AI", "type": "openai-compatible", "base_url": "https://api.together.xyz/v1", "prefix": "together", "prefix_enabled": 1},
+    "fireworks": {"name": "Fireworks AI", "type": "openai-compatible", "base_url": "https://api.fireworks.ai/inference/v1", "prefix": "fireworks", "prefix_enabled": 1},
 }
 
 
@@ -72,7 +71,7 @@ def provider_payload(args):
             "type": args.type,
             "base_url": args.base_url,
             "prefix": args.prefix or normalize(args.provider).replace(" ", "-"),
-            "prefix_enabled": 0,
+            "prefix_enabled": 1,
         }
 
     if args.name:
@@ -83,6 +82,7 @@ def provider_payload(args):
         data["base_url"] = args.base_url
     if args.prefix:
         data["prefix"] = args.prefix
+        data["prefix_enabled"] = 1
     for field in ("auth_type", "auth_header", "auth_prefix", "key_query_param", "chat_path", "models_path", "request_format"):
         value = getattr(args, field)
         if value:
@@ -132,7 +132,7 @@ def main():
     parser.add_argument("--password", default=os.getenv("AI_ROUTER_PASSWORD", ""))
     parser.add_argument("--provider", default=os.getenv("AI_ROUTER_IMPORT_PROVIDER", ""), help="Provider name/id/prefix, e.g. novai, nvidia, openrouter.")
     parser.add_argument("--name", default="", help="Provider display name when creating a custom provider.")
-    parser.add_argument("--type", default="openai-compatible", choices=["openai-compatible", "anthropic-compatible", "claude-cli"])
+    parser.add_argument("--type", default="openai-compatible", choices=["openai-compatible", "anthropic-compatible"])
     parser.add_argument("--base-url", default="", help="Required for custom providers not in presets.")
     parser.add_argument("--prefix", default="", help="Provider prefix when creating/updating provider payload.")
     parser.add_argument("--auth-type", default="", choices=["", "bearer", "x-api-key", "api-key", "header", "query", "none"], help="How to send the provider key.")

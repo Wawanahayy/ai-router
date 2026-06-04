@@ -11,7 +11,7 @@ from . import db, rtk
 from .services.models import fetch_upstream_models, invalidate_models_cache, proxy_models
 from .services.provider_tests import test_provider, test_provider_tools
 from .services.streaming import STREAM_CONNECT_TIMEOUT, STREAM_STALL_TIMEOUT, proxy_stream
-from .services.upstream import build_request, parse_extra_headers, provider_format
+from .services.upstream import build_request, provider_format
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,6 @@ UPSTREAM_CONNECT_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_CONNECT_TIMEOUT",
 UPSTREAM_READ_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_READ_TIMEOUT", "300"))
 UPSTREAM_WRITE_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_WRITE_TIMEOUT", "20"))
 UPSTREAM_POOL_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_POOL_TIMEOUT", "20"))
-CLAUDE_CLI_TIMEOUT = float(os.getenv("AI_ROUTER_CLAUDE_CLI_TIMEOUT", "300"))
 
 
 def _upstream_timeout():
@@ -107,7 +106,7 @@ async def resolve_model(model: str):
     3. Check if alias exists but deactivated -> return None (explicit reject)
     4. Prefix match (only if provider prefix_enabled=1): "prefix/model" -> find provider + active alias
     5. Direct model name -> round-robin across providers that have this model active
-    6. Empty model only: round-robin across active providers with alive keys
+    6. Fallback: round-robin across active providers with alive keys
     """
     if not model or not model.strip():
         return await _auto_pick_rr()
@@ -131,7 +130,7 @@ async def resolve_model(model: str):
         prefix, _ = lookup_model.split("/", 1)
         _, actual_model = requested_model.split("/", 1)
         providers = await db.list_providers()
-        matching = [p for p in providers if (p.get("prefix") or "").lower() == prefix and p["is_active"] and p.get("prefix_enabled", 0)]
+        matching = [p for p in providers if p["prefix"] == prefix and p["is_active"] and p.get("prefix_enabled", 0)]
         if matching:
             for p in matching:
                 for a in p.get("aliases", []):
@@ -148,7 +147,6 @@ async def resolve_model(model: str):
                 picked = available[rr % len(available)]
                 await db._set_rr(f"prefix_rr_{prefix}", (rr + 1) % len(available))
                 return picked["id"], actual_model
-            return None, requested_model
     
     providers = await db.list_providers()
     matching = []
@@ -166,7 +164,7 @@ async def resolve_model(model: str):
         await db._set_rr(f"model_rr_{lookup_model}", (rr + 1) % len(matching))
         return picked["id"], actual_model
     
-    return None, requested_model
+    return await _auto_pick_rr()
 
 
 async def _auto_pick_rr():
@@ -279,8 +277,6 @@ def _chain_item(provider, key, model, status_code, error_msg, latency_ms):
 
 def _provider_unsupported_reason(provider: dict, request_body: dict):
     has_tools = any(k in request_body for k in ("tools", "tool_choice", "function_call", "functions"))
-    if provider.get("type") == "claude-cli":
-        return None
     if has_tools and not provider.get("supports_tools", 1):
         return f"Provider '{provider['name']}' does not support tool calling"
     if request_body.get("stream") and not provider.get("supports_streaming", 1):
@@ -316,392 +312,6 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
         request_body["stream_options"] = stream_options
 
     return {"url": url, "headers": headers, "body": request_body}
-
-
-def _claude_cli_env(provider: dict, key: dict, actual_model: str) -> dict:
-    env = os.environ.copy()
-    env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-    if provider.get("base_url"):
-        env["ANTHROPIC_BASE_URL"] = provider["base_url"].rstrip("/")
-    if key and key.get("key_value"):
-        env["ANTHROPIC_AUTH_TOKEN"] = key["key_value"]
-        env["ANTHROPIC_API_KEY"] = key["key_value"]
-    if actual_model:
-        env["ANTHROPIC_MODEL"] = actual_model
-
-    for name, value in parse_extra_headers(provider).items():
-        if not isinstance(name, str):
-            continue
-        if name.startswith("CLAUDE_") or name.startswith("ANTHROPIC_") or name.startswith("AI_ROUTER_"):
-            env[name] = str(value)
-    return env
-
-
-def _cli_tool_definitions(body: dict) -> list[dict]:
-    tools = body.get("tools") or body.get("functions") or []
-    result = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        function = tool.get("function") or tool
-        name = function.get("name")
-        if not name:
-            continue
-        result.append({
-            "name": name,
-            "description": function.get("description") or "",
-            "parameters": function.get("parameters") or function.get("input_schema") or {},
-        })
-    return result
-
-
-def _cli_tool_instruction(body: dict) -> str | None:
-    tools = _cli_tool_definitions(body)
-    if not tools:
-        return None
-
-    choice = body.get("tool_choice") or body.get("function_call") or "auto"
-    return (
-        "You may call exactly one tool if needed.\n"
-        "Available tools:\n"
-        f"{json.dumps(tools, ensure_ascii=False)}\n\n"
-        f"Tool choice: {json.dumps(choice, ensure_ascii=False)}\n\n"
-        "If you need a tool, respond only with valid JSON in this exact shape:\n"
-        '{"tool_call":{"name":"tool_name","arguments":{}}}\n'
-        "If you do not need a tool, respond normally as plain text.\n"
-        "Do not wrap JSON in markdown fences."
-    )
-
-
-def _request_to_cli_prompt(body: dict, native_anthropic: bool = False) -> str:
-    parts = []
-    system = body.get("system")
-    if isinstance(system, list):
-        system = "\n".join(_content_to_text(part.get("text") if isinstance(part, dict) else part) for part in system)
-    if system:
-        parts.append(f"System:\n{_content_to_text(system)}")
-
-    if not native_anthropic:
-        for msg in body.get("messages") or []:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role") or "user"
-            if role == "system":
-                text = _content_to_text(msg.get("content"))
-                if text:
-                    parts.append(f"System:\n{text}")
-                continue
-            text = _content_to_text(msg.get("content"))
-            if text:
-                parts.append(f"{role.title()}:\n{text}")
-    else:
-        for msg in body.get("messages") or []:
-            if not isinstance(msg, dict):
-                continue
-            text = _content_to_text(msg.get("content"))
-            if text:
-                parts.append(f"{(msg.get('role') or 'user').title()}:\n{text}")
-
-    json_instruction = _json_mode_instruction(body.get("response_format"))
-    if json_instruction:
-        parts.append(f"System:\n{json_instruction}")
-
-    tool_instruction = _cli_tool_instruction(body)
-    if tool_instruction:
-        parts.append(f"System:\n{tool_instruction}")
-
-    return "\n\n".join(parts).strip() or "Continue."
-
-
-def _extract_cli_tool_call(text: str, request_body: dict) -> dict | None:
-    if not _cli_tool_definitions(request_body):
-        return None
-
-    parsed = _jsonish_tool_arguments(text)
-    if parsed is None:
-        return None
-    try:
-        data = json.loads(parsed)
-    except Exception:
-        return None
-
-    tool_call = data.get("tool_call") if isinstance(data, dict) else None
-    if not isinstance(tool_call, dict):
-        return None
-
-    name = tool_call.get("name")
-    allowed = {tool["name"] for tool in _cli_tool_definitions(request_body)}
-    if not name or name not in allowed:
-        return None
-
-    arguments = tool_call.get("arguments")
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, (dict, list)):
-        return None
-
-    return {
-        "id": f"call_cli_{int(time.time() * 1000)}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(arguments, ensure_ascii=False),
-        },
-    }
-
-
-def _openai_cli_response(text: str, model: str, tokens_in: int, tokens_out: int, request_body: dict | None = None) -> dict:
-    tool_call = _extract_cli_tool_call(text, request_body or {})
-    message = {"role": "assistant", "content": text}
-    finish_reason = "stop"
-    if tool_call:
-        message = {"role": "assistant", "content": None, "tool_calls": [tool_call]}
-        finish_reason = "tool_calls"
-
-    return {
-        "id": f"chatcmpl-cli-{int(time.time() * 1000)}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": {
-            "prompt_tokens": tokens_in,
-            "completion_tokens": tokens_out,
-            "total_tokens": tokens_in + tokens_out,
-        },
-    }
-
-
-def _anthropic_cli_response(text: str, model: str, tokens_in: int, tokens_out: int) -> dict:
-    return {
-        "id": f"msg_cli_{int(time.time() * 1000)}",
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out},
-    }
-
-
-def _parse_claude_cli_json_output(out: str, request_body: dict) -> tuple[str, int, int, str | None]:
-    try:
-        data = json.loads(out)
-    except Exception:
-        tokens_in = _estimate_input_tokens(request_body)
-        tokens_out = _estimate_output_tokens_from_response(out)
-        return out, tokens_in, tokens_out, None
-
-    if not isinstance(data, dict) or data.get("type") != "result":
-        tokens_in = _estimate_input_tokens(request_body)
-        tokens_out = _estimate_output_tokens_from_response(data)
-        return out, tokens_in, tokens_out, None
-
-    result = data.get("result") or ""
-    if data.get("is_error"):
-        return result, 0, 0, result or "Claude CLI returned an error"
-
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    tokens_in = int(usage.get("input_tokens") or 0)
-    tokens_in += int(usage.get("cache_creation_input_tokens") or 0)
-    tokens_in += int(usage.get("cache_read_input_tokens") or 0)
-    tokens_out = int(usage.get("output_tokens") or 0)
-    if not tokens_in:
-        tokens_in = _estimate_input_tokens(request_body)
-    if not tokens_out:
-        tokens_out = _estimate_output_tokens_from_response(result)
-    return result, tokens_in, tokens_out, None
-
-
-async def _run_claude_cli(provider: dict, key: dict, actual_model: str, request_body: dict, native_anthropic: bool = False):
-    body = copy.deepcopy(request_body)
-    body["model"] = actual_model
-    if not native_anthropic:
-        _normalize_messages(body, provider, actual_model)
-        rtk_enabled = (await db.get_setting("rtk_enabled")) == "true"
-        body, _ = rtk.compress_request_body(body, enabled=rtk_enabled)
-    else:
-        body.setdefault("max_tokens", 4096)
-
-    prompt = _request_to_cli_prompt(body, native_anthropic=native_anthropic)
-    binary = os.getenv("AI_ROUTER_CLAUDE_CLI_BINARY", "claude")
-    command = [binary, "-p", "--bare", "--no-session-persistence", "--output-format", "json"]
-    if actual_model:
-        command.extend(["--model", actual_model])
-
-    start = time.time()
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_claude_cli_env(provider, key, actual_model),
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")),
-            timeout=_timeout_value(CLAUDE_CLI_TIMEOUT),
-        )
-    except asyncio.TimeoutError:
-        latency = int((time.time() - start) * 1000)
-        if proc:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-        return None, 504, latency, f"Claude CLI timeout after {CLAUDE_CLI_TIMEOUT:g}s", 0, 0
-    except FileNotFoundError:
-        latency = int((time.time() - start) * 1000)
-        return None, 500, latency, f"Claude CLI binary not found: {binary}", 0, 0
-    except Exception as e:
-        latency = int((time.time() - start) * 1000)
-        return None, 500, latency, str(e)[:500], 0, 0
-
-    latency = int((time.time() - start) * 1000)
-    out = (stdout or b"").decode("utf-8", errors="replace").strip()
-    err = (stderr or b"").decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
-        return None, 502, latency, (err or out or f"Claude CLI exited with code {proc.returncode}")[:500], 0, 0
-    if not out:
-        return None, 502, latency, (err or "Claude CLI returned empty output")[:500], 0, 0
-
-    result_text, tokens_in, tokens_out, parsed_error = _parse_claude_cli_json_output(out, body)
-    if parsed_error:
-        return None, 502, latency, parsed_error[:500], tokens_in, tokens_out
-    if native_anthropic:
-        return _anthropic_cli_response(result_text, actual_model, tokens_in, tokens_out), 200, latency, None, tokens_in, tokens_out
-    return _openai_cli_response(result_text, actual_model, tokens_in, tokens_out, body), 200, latency, None, tokens_in, tokens_out
-
-
-async def _proxy_claude_cli_attempt(provider: dict, key: dict, actual_model: str, request_body: dict, local_key_id: str, fallback_chain: list, native_anthropic: bool = False):
-    response_data, status, latency, error_msg, tokens_in, tokens_out = await _run_claude_cli(
-        provider, key, actual_model, request_body, native_anthropic=native_anthropic
-    )
-    if status >= 400:
-        await db.mark_key_error(key["id"], status, error_msg, actual_model)
-        item = _chain_item(provider, key, actual_model, status, error_msg, latency)
-        fallback_chain.append(item)
-        await db.add_log(provider["id"], key["id"], actual_model, 0, 0, latency, status, error_msg, local_key_id, fallback_chain)
-        return response_data, status, error_msg
-
-    total_tokens = tokens_in + tokens_out
-    await db.mark_key_success(key["id"], tokens_in, tokens_out)
-    await db.clear_key_model_lock(key["id"], actual_model)
-    await db.mark_key_used(key["id"])
-    if local_key_id:
-        await db.mark_local_key_used(local_key_id, total_tokens)
-    await db.add_log(provider["id"], key["id"], actual_model, tokens_in, tokens_out, latency, status, local_key_id=local_key_id, fallback_chain=fallback_chain or None)
-    return response_data, status, None
-
-
-def _openai_stream_chunk(base_id: str, model: str, delta: dict, finish_reason=None):
-    return {
-        "id": base_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }],
-    }
-
-
-def _synthetic_openai_stream(response_data: dict, model: str):
-    async def generate():
-        base_id = response_data.get("id") or f"chatcmpl-cli-stream-{int(time.time() * 1000)}"
-        yield "data: " + json.dumps(_openai_stream_chunk(base_id, model, {"role": "assistant"}), ensure_ascii=False) + "\n\n"
-
-        choice = (response_data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        finish_reason = choice.get("finish_reason") or "stop"
-        tool_calls = message.get("tool_calls")
-        content = message.get("content")
-
-        if tool_calls:
-            stream_tool_calls = []
-            for idx, tool_call in enumerate(tool_calls):
-                item = dict(tool_call)
-                item.setdefault("index", idx)
-                stream_tool_calls.append(item)
-            yield "data: " + json.dumps(
-                _openai_stream_chunk(base_id, model, {"tool_calls": stream_tool_calls}),
-                ensure_ascii=False,
-            ) + "\n\n"
-        elif content:
-            yield "data: " + json.dumps(
-                _openai_stream_chunk(base_id, model, {"content": content}),
-                ensure_ascii=False,
-            ) + "\n\n"
-
-        yield "data: " + json.dumps(_openai_stream_chunk(base_id, model, {}, finish_reason), ensure_ascii=False) + "\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
-
-
-def _claude_cli_live_synthetic_stream(provider: dict, key: dict, actual_model: str, request_body: dict, local_key_id: str, fallback_chain: list):
-    async def generate():
-        base_id = f"chatcmpl-cli-stream-{int(time.time() * 1000)}"
-        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {"role": "assistant"}), ensure_ascii=False) + "\n\n"
-        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {"content": ""}), ensure_ascii=False) + "\n\n"
-
-        body = copy.deepcopy(request_body)
-        body["stream"] = False
-        response_data, status, error_msg = await _proxy_claude_cli_attempt(
-            provider, key, actual_model, body, local_key_id, fallback_chain
-        )
-        if status >= 400:
-            error_text = error_msg or "Claude CLI stream failed"
-            yield "data: " + json.dumps(
-                _openai_stream_chunk(base_id, actual_model, {"content": error_text}, "stop"),
-                ensure_ascii=False,
-            ) + "\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        choice = (response_data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        finish_reason = choice.get("finish_reason") or "stop"
-        tool_calls = message.get("tool_calls")
-        content = message.get("content")
-
-        if tool_calls:
-            stream_tool_calls = []
-            for idx, tool_call in enumerate(tool_calls):
-                item = dict(tool_call)
-                item.setdefault("index", idx)
-                stream_tool_calls.append(item)
-            yield "data: " + json.dumps(
-                _openai_stream_chunk(base_id, actual_model, {"tool_calls": stream_tool_calls}),
-                ensure_ascii=False,
-            ) + "\n\n"
-        elif content:
-            yield "data: " + json.dumps(
-                _openai_stream_chunk(base_id, actual_model, {"content": content}),
-                ensure_ascii=False,
-            ) + "\n\n"
-
-        yield "data: " + json.dumps(_openai_stream_chunk(base_id, actual_model, {}, finish_reason), ensure_ascii=False) + "\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 def _normalize_messages(body: dict, provider: dict | None = None, model: str = ""):
@@ -771,10 +381,7 @@ async def proxy_chat_completions(request_body: dict, headers: dict, local_key_id
     # can corrupt the SSE response. We still try the combo/provider/key chain before
     # the first byte is sent, then stay on the first upstream that opens cleanly.
     if stream:
-        stream_response = await _proxy_stream_with_fallback(request_body, attempts, local_key_id)
-        if isinstance(stream_response, tuple):
-            return stream_response
-        return stream_response, 200
+        return await _proxy_stream_with_fallback(request_body, attempts, local_key_id)
 
     return await _proxy_with_fallback(request_body, attempts, local_key_id)
 
@@ -810,14 +417,13 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
                 })
                 continue
             provider = await db.get_provider(provider_id)
-            if not provider or (provider_format(provider) != "anthropic-compatible" and provider.get("type") != "claude-cli"):
+            if not provider or provider_format(provider) != "anthropic-compatible":
                 continue
 
-            unsupported = _provider_unsupported_reason(provider, request_body)
-            if unsupported:
-                last_error = unsupported
+            if request_body.get("stream") and not provider.get("supports_streaming", 1):
+                last_error = f"Provider '{provider['name']}' does not support streaming"
                 last_status = 400
-                fallback_chain.append(_chain_item(provider, None, actual_model, 400, unsupported, 0))
+                fallback_chain.append(_chain_item(provider, None, actual_model, 400, last_error, 0))
                 continue
 
             keys = await db.list_alive_keys(provider_id, model=actual_model)
@@ -826,26 +432,9 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
                 fallback_chain.append(_chain_item(provider, None, actual_model, 502, last_error, 0))
                 continue
 
-            if provider.get("type") == "claude-cli":
-                for key in keys:
-                    response_data, status, error_msg = await _proxy_claude_cli_attempt(
-                        provider, key, actual_model, request_body, local_key_id, fallback_chain, native_anthropic=True
-                    )
-                    if status < 400:
-                        return response_data, status
-                    last_error = error_msg
-                    last_status = status
-                    if not _fallbackable(status):
-                        break
-                wait_seconds = _transient_wait_seconds(last_status)
-                if wait_seconds:
-                    await asyncio.sleep(wait_seconds)
-                continue
-
             prepared = _prepare_anthropic_native(provider, copy.deepcopy(request_body), actual_model)
             if prepared["body"].get("stream"):
-                stream_response = await _proxy_anthropic_native_stream(prepared, provider, keys[0], actual_model, local_key_id)
-                return stream_response, 200
+                return await _proxy_anthropic_native_stream(prepared, provider, keys[0], actual_model, local_key_id)
 
             for key in keys:
                 auth = build_request(provider, "chat", key["key_value"], event_stream=bool(prepared["body"].get("stream")))
@@ -903,11 +492,6 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
     return {"error": last_error, "fallback_chain": fallback_chain}, last_status
 
 
-async def proxy_anthropic_count_tokens(request_body: dict):
-    """Return an Anthropic-compatible token count estimate for gateway clients."""
-    return {"input_tokens": _estimate_input_tokens(request_body)}, 200
-
-
 async def _proxy_stream_attempt(request_body: dict, provider_id: str, actual_model: str, local_key_id: str = None):
     provider = await db.get_provider(provider_id)
     if not provider:
@@ -950,9 +534,6 @@ async def _proxy_stream_with_fallback(request_body: dict, attempts: list, local_
         if not keys:
             last_error = f"No alive API keys for provider '{provider['name']}'"
             continue
-
-        if provider.get("type") == "claude-cli":
-            return _claude_cli_live_synthetic_stream(provider, keys[0], actual_model, request_body, local_key_id, [])
 
         prepared = await _prepare_upstream(provider, copy.deepcopy(request_body), actual_model)
         for key in keys:
@@ -1025,22 +606,6 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                 fallback_chain.append(_chain_item(provider, None, actual_model, 502, msg, 0))
                 last_error = msg
                 last_status = 502
-                continue
-
-            if provider.get("type") == "claude-cli":
-                for key in keys:
-                    response_data, status, error_msg = await _proxy_claude_cli_attempt(
-                        provider, key, actual_model, request_body, local_key_id, fallback_chain
-                    )
-                    if status < 400:
-                        return response_data, status
-                    last_error = error_msg
-                    last_status = status
-                    if not _fallbackable(status):
-                        break
-                wait_seconds = _transient_wait_seconds(last_status)
-                if wait_seconds:
-                    await asyncio.sleep(wait_seconds)
                 continue
 
             prepared = await _prepare_upstream(provider, copy.deepcopy(request_body), actual_model)

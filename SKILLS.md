@@ -55,10 +55,6 @@ bash start.sh setup
 bash start.sh run
 ```
 
-`bash start.sh setup` creates the Python venv, installs backend requirements,
-creates `.env`, and attempts to install Claude Code CLI globally with npm when
-npm is available.
-
 Manual backend setup:
 
 ```bash
@@ -138,7 +134,6 @@ GET  /v1/models
 POST /v1/models
 POST /v1/chat/completions
 POST /v1/messages
-POST /v1/messages/count_tokens
 ```
 
 OpenAI-compatible clients should call:
@@ -155,18 +150,6 @@ POST /v1/messages
 Authorization: Bearer ar-your-local-key
 anthropic-version: 2023-06-01
 ```
-
-Claude CLI provider:
-
-Claude-compatible direct HTTP upstreams use provider type `anthropic-compatible`.
-When the user wants Claude Code CLI as the upstream adapter, use provider type
-`claude-cli`. The provider form should collect base URL, upstream API key, and
-models just like other providers; models can then be used directly or inside
-combos. AI Router runs the local `claude` binary internally and passes provider
-settings through environment variables, so users do not need to manage `export`
-commands manually. Claude Code CLI is installed by `bash start.sh setup` when
-npm is available; if that fails, tell the user to run
-`npm install -g @anthropic-ai/claude-code`.
 
 The local `ar-...` key belongs to AI Router. Upstream provider keys are stored
 inside AI Router and should never be exposed to clients.
