@@ -32,6 +32,16 @@ export default function Logs() {
     }
   }
 
+  function formatError(error) {
+    if (!error) return ''
+    if (typeof error !== 'string') return String(error)
+    try {
+      return JSON.stringify(JSON.parse(error), null, 2)
+    } catch {
+      return error
+    }
+  }
+
   const usagePeriods = stats?.usage_periods || {}
 
   return (
@@ -103,6 +113,7 @@ export default function Logs() {
               {logs.map(l => {
                 const chain = parseChain(l.fallback_chain)
                 const isExpanded = expanded === l.id
+                const hasError = Boolean(l.error)
                 return (
                   <Fragment key={l.id}>
                     <tr key={l.id} className="border-b border-[#1e1e2e]/50 hover:bg-white/[0.02]">
@@ -128,7 +139,19 @@ export default function Logs() {
                           </div>
                         ) : <span className="text-amber-300">unpriced</span>}
                       </td>
-                      <td className="py-2 px-2 text-xs text-red-400 max-w-[250px] truncate">{l.error || '-'}</td>
+                      <td className="py-2 px-2 text-xs max-w-[250px]">
+                        {hasError ? (
+                          <button
+                            onClick={() => setExpanded(isExpanded ? null : l.id)}
+                            className="text-red-400 hover:text-red-300 max-w-[250px] truncate block text-left"
+                            title="Show error details"
+                          >
+                            {l.error}
+                          </button>
+                        ) : (
+                          <span className="text-slate-600">-</span>
+                        )}
+                      </td>
                       <td className="py-2 px-2 text-xs">
                         {chain.length ? (
                           <button onClick={() => setExpanded(isExpanded ? null : l.id)} className="text-amber-300 hover:text-amber-200">
@@ -139,17 +162,30 @@ export default function Logs() {
                         )}
                       </td>
                     </tr>
-                    {isExpanded && chain.length > 0 && (
+                    {isExpanded && (chain.length > 0 || hasError) && (
                       <tr key={`${l.id}-fallback`} className="border-b border-[#1e1e2e]/50 bg-black/20">
                         <td colSpan={9} className="px-2 py-3">
-                          <div className="space-y-1">
-                            {chain.map((item, idx) => (
-                              <div key={idx} className="text-xs text-slate-300 font-mono">
-                                {idx + 1}. {item.provider || item.provider_id || '-'} / {item.model || '-'} / {item.key_label || item.key_id || 'no-key'} {'->'} {item.status_code || '-'} {item.error_kind || ''}
-                                {item.latency_ms ? ` (${item.latency_ms}ms)` : ''}
-                                {item.error ? <span className="text-red-300"> | {item.error}</span> : null}
+                          <div className="space-y-3">
+                            {hasError && (
+                              <div>
+                                <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Error detail</div>
+                                <pre className="whitespace-pre-wrap break-words rounded bg-black/30 p-3 text-xs text-red-200 font-mono">
+                                  {formatError(l.error)}
+                                </pre>
                               </div>
-                            ))}
+                            )}
+                            {chain.length > 0 && (
+                              <div className="space-y-1">
+                                <div className="text-xs uppercase tracking-wide text-slate-500">Fallback attempts</div>
+                                {chain.map((item, idx) => (
+                                  <div key={idx} className="text-xs text-slate-300 font-mono">
+                                    {idx + 1}. {item.provider || item.provider_id || '-'} / {item.model || '-'} / {item.key_label || item.key_id || 'no-key'} {'->'} {item.status_code || '-'} {item.error_kind || ''}
+                                    {item.latency_ms ? ` (${item.latency_ms}ms)` : ''}
+                                    {item.error ? <span className="text-red-300"> | {item.error}</span> : null}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </td>
                       </tr>
