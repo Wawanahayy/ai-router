@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import { getLogs, getStats, syncOpenRouterPricing } from '../api'
+import { getLogs, getStats } from '../api'
 
 export default function Logs() {
   const [logs, setLogs] = useState([])
@@ -7,8 +7,6 @@ export default function Logs() {
   const [limit, setLimit] = useState(100)
   const [expanded, setExpanded] = useState(null)
   const [stats, setStats] = useState(null)
-  const [syncingPricing, setSyncingPricing] = useState(false)
-  const [pricingStatus, setPricingStatus] = useState('')
 
   const load = useCallback(async () => {
     try {
@@ -34,21 +32,6 @@ export default function Logs() {
     }
   }
 
-  async function handleSyncPricing() {
-    setSyncingPricing(true)
-    setPricingStatus('')
-    try {
-      const result = await syncOpenRouterPricing()
-      setPricingStatus(`Synced ${result.models || 0} catalog prices, updated ${result.logs_updated || 0} logs.`)
-      await load()
-    } catch (e) {
-      console.error(e)
-      setPricingStatus('Price sync failed.')
-    } finally {
-      setSyncingPricing(false)
-    }
-  }
-
   const usagePeriods = stats?.usage_periods || {}
 
   return (
@@ -63,15 +46,9 @@ export default function Logs() {
             <option value={250}>250</option>
             <option value={500}>500</option>
           </select>
-          <button onClick={handleSyncPricing} className="btn-ghost text-sm" disabled={syncingPricing}>
-            {syncingPricing ? 'Syncing...' : 'Sync official prices'}
-          </button>
           <button onClick={load} className="btn-ghost text-sm">Refresh</button>
         </div>
       </div>
-      {pricingStatus && (
-        <div className="text-xs text-slate-400 -mt-3">{pricingStatus}</div>
-      )}
 
       <div className="grid grid-cols-4 gap-3">
         {[
