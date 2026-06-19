@@ -4,10 +4,39 @@ import json
 import logging
 import uuid
 import re
+import time
 from . import config
 from .services.pricing import fetch_openrouter_pricing
 
 logger = logging.getLogger(__name__)
+import asyncio
+from typing import Optional
+
+# Cache for has_alive_key / hot list_alive_keys path. Used by resolve_combo_candidates
+# which calls has_alive_key in a loop per request. Without cache, each call fires 3
+# writes (UPDATE cooldown, DELETE locks, cleanup) + commit → write-lock contention.
+_ALIVE_KEY_TTL = 30.0
+_ALIVE_KEY_CACHE: dict[tuple, tuple[float, bool]] = {}
+_ALIVE_KEY_CACHE_FULL: dict[tuple, tuple[float, list]] = {}
+
+async def _with_retry(coro_factory, max_attempts=3, base_delay=0.05):
+    """Execute coroutine with exponential backoff retry on OperationalError (locked)."""
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            return await coro_factory()
+        except aiosqlite.OperationalError as e:
+            last_err = e
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                    continue
+            raise
+        except Exception:
+            raise
+    raise last_err
+
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS providers (
@@ -122,6 +151,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
   model_id TEXT NOT NULL,
   input_per_million REAL DEFAULT 0,
   output_per_million REAL DEFAULT 0,
+  context_window INTEGER DEFAULT 0,
   source TEXT DEFAULT '',
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -167,6 +197,9 @@ async def get_db() -> aiosqlite.Connection:
         _db.row_factory = aiosqlite.Row
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
+        await _db.execute("PRAGMA busy_timeout=30000")
+        await _db.execute("PRAGMA synchronous=NORMAL")
+        await _db.execute("PRAGMA temp_store=MEMORY")
         await _db.executescript(SCHEMA)
         for mig in [
             "ALTER TABLE providers ADD COLUMN prefix_enabled INTEGER DEFAULT 0",
@@ -201,13 +234,16 @@ async def get_db() -> aiosqlite.Connection:
               model_id TEXT NOT NULL,
               input_per_million REAL DEFAULT 0,
               output_per_million REAL DEFAULT 0,
+              context_window INTEGER DEFAULT 0,
               source TEXT DEFAULT '',
               updated_at TEXT DEFAULT (datetime('now'))
             )""",
+            "ALTER TABLE model_pricing ADD COLUMN context_window INTEGER DEFAULT 0",
             "ALTER TABLE combos ADD COLUMN mode TEXT DEFAULT 'round_robin'",
             "ALTER TABLE combo_models ADD COLUMN alias TEXT DEFAULT ''",
             "ALTER TABLE combo_models ADD COLUMN sort_order INTEGER DEFAULT 0",
             "ALTER TABLE combo_models ADD COLUMN created_at TEXT DEFAULT (datetime('now'))",
+            "ALTER TABLE key_model_locks ADD COLUMN retry_count INTEGER DEFAULT 0",
         ]:
             try:
                 await _db.execute(mig)
@@ -396,18 +432,18 @@ async def _next_auto_key_label(db, provider_id: str = None, table: str = "api_ke
 
 async def list_keys(provider_id: str = None, status: str = None):
     db = await get_db()
-    q = "SELECT * FROM api_keys"
+    q = "SELECT k.*, p.name as provider_name FROM api_keys k LEFT JOIN providers p ON k.provider_id=p.id"
     conds = []
     vals = []
     if provider_id:
-        conds.append("provider_id=?")
+        conds.append("k.provider_id=?")
         vals.append(provider_id)
     if status:
-        conds.append("status=?")
+        conds.append("k.status=?")
         vals.append(status)
     if conds:
         q += " WHERE " + " AND ".join(conds)
-    q += " ORDER BY created_at"
+    q += " ORDER BY p.name, k.created_at"
     cursor = await db.execute(q, vals)
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -474,21 +510,73 @@ async def delete_key(key_id: str):
 
 # --- Key Selection (round-robin) ---
 
-async def get_alive_key(provider_id: str, model: str = None):
-    keys = await list_alive_keys(provider_id, model=model)
+async def get_alive_key(provider_id: str, advance: bool = False, model: str = None):
+    """Return first alive key for provider. advance=False uses cached read-only path
+    (no UPDATE/DELETE writes) — safe for hot paths like proxy chat completions."""
+    keys = await list_alive_keys(provider_id, advance=advance, model=model)
     return keys[0] if keys else None
 
 
 async def has_alive_key(provider_id: str, model: str = None) -> bool:
-    keys = await list_alive_keys(provider_id, advance=False, model=model)
-    return bool(keys)
+    """Cheap check for any alive key. Uses 30s TTL cache to avoid write-storm
+    when resolve_combo_candidates calls this in a loop per request."""
+    cache_key = (provider_id, (model or "").lower())
+    now = time.monotonic()
+    cached = _ALIVE_KEY_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < _ALIVE_KEY_TTL:
+        return cached[1]
+    # Cache miss or expired: read-only path (no UPDATE/DELETE writes)
+    has = await _with_retry(
+        lambda: _has_alive_key_readonly_impl(provider_id, model)
+    )
+    _ALIVE_KEY_CACHE[cache_key] = (now, has)
+    return has
+
+
+async def invalidate_alive_key_cache(provider_id: str = None, model: str = None):
+    """Drop cache entries when key state changes (mark_key_error/success/cooldown)."""
+    if provider_id is None:
+        _ALIVE_KEY_CACHE.clear()
+        return
+    if model is None:
+        # Drop all model variants for this provider
+        for key in [k for k in _ALIVE_KEY_CACHE if k[0] == provider_id]:
+            _ALIVE_KEY_CACHE.pop(key, None)
+    else:
+        _ALIVE_KEY_CACHE.pop((provider_id, model.lower()), None)
 
 
 async def list_alive_keys(provider_id: str, advance: bool = True, model: str = None):
-    """Return all alive keys for a provider, rotated from the current RR position."""
+    """Return all alive keys for a provider, rotated from the current RR position. Auto-retry on lock.
+
+    Note: side effects (cooldown recovery, lock cleanup) only run when advance=True
+    or when the cache is cold. Hot path skips writes to avoid lock contention.
+    """
+    if not advance and model is not None:
+        # Hot read path used by has_alive_key — fully cache + read-only
+        cache_key = (provider_id, model.lower())
+        now = time.monotonic()
+        cached = _ALIVE_KEY_CACHE_FULL.get(cache_key)
+        if cached is not None and (now - cached[0]) < _ALIVE_KEY_TTL:
+            return cached[1]
+        keys = await _with_retry(
+            lambda: _list_alive_keys_readonly_impl(provider_id, model)
+        )
+        _ALIVE_KEY_CACHE_FULL[cache_key] = (now, keys)
+        return keys
+    # Cold path: full impl with side effects
+    return await _with_retry(lambda: _list_alive_keys_impl(provider_id, advance, model))
+
+
+async def _list_alive_keys_impl(provider_id: str, advance: bool = True, model: str = None):
+    """Implementation of list_alive_keys with auto-retry wrapper.
+
+    WARNING: This path runs side-effecting writes (cooldown recovery, lock cleanup).
+    Hot read paths (has_alive_key) MUST use _list_alive_keys_readonly_impl instead,
+    otherwise concurrent requests will hammer the SQLite write lock.
+    """
     db = await get_db()
     now = datetime_utc_now()
-    # Auto-recover cooldown keys whose cooldown has expired
     await db.execute(
         "UPDATE api_keys SET status='alive', cooldown_until=NULL WHERE provider_id=? AND status='cooldown' AND cooldown_until IS NOT NULL AND cooldown_until < ?",
         (provider_id, now)
@@ -496,7 +584,6 @@ async def list_alive_keys(provider_id: str, advance: bool = True, model: str = N
     await db.execute("DELETE FROM key_model_locks WHERE locked_until < ?", (now,))
     await cleanup_context_limit_state(db)
     await db.commit()
-    # Get alive keys ordered by last_used (round-robin: least recently used first)
     if model:
         cursor = await db.execute(
             """
@@ -527,6 +614,68 @@ async def list_alive_keys(provider_id: str, advance: bool = True, model: str = N
     return ordered
 
 
+async def _list_alive_keys_readonly_impl(provider_id: str, model: str = None):
+    """Read-only variant of _list_alive_keys_impl. No UPDATE/DELETE/cleanup,
+    no commit. Pure SELECT — safe to call from hot read paths like has_alive_key.
+
+    Note: cooldown recovery and lock cleanup are deferred to a separate cold path
+    (see mark_key_error/mark_key_success which invalidate the cache and the periodic
+    background recovery in resolve_combo_candidates fallback).
+    """
+    db = await get_db()
+    now = datetime_utc_now()
+    if model:
+        cursor = await db.execute(
+            """
+            SELECT k.* FROM api_keys k
+            WHERE k.provider_id=? AND k.status='alive'
+              AND NOT EXISTS (
+                SELECT 1 FROM key_model_locks l
+                WHERE l.key_id=k.id AND LOWER(l.model)=LOWER(?) AND l.locked_until >= ?
+              )
+            ORDER BY k.last_used ASC NULLS FIRST
+            """,
+            (provider_id, model, now)
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM api_keys WHERE provider_id=? AND status='alive' ORDER BY last_used ASC NULLS FIRST",
+            (provider_id,)
+        )
+    keys = [dict(r) for r in await cursor.fetchall()]
+    if not keys:
+        return []
+    # Rotate the returned list (same logic as full impl, but no rr state mutation)
+    rr = await _get_rr(f"key_rr_{provider_id}")
+    start = rr % len(keys)
+    return keys[start:] + keys[:start]
+
+
+async def _has_alive_key_readonly_impl(provider_id: str, model: str = None) -> bool:
+    """Read-only boolean check. Cheap SELECT EXISTS — no writes, no commit."""
+    db = await get_db()
+    now = datetime_utc_now()
+    if model:
+        cursor = await db.execute(
+            """
+            SELECT 1 FROM api_keys k
+            WHERE k.provider_id=? AND k.status='alive'
+              AND NOT EXISTS (
+                SELECT 1 FROM key_model_locks l
+                WHERE l.key_id=k.id AND LOWER(l.model)=LOWER(?) AND l.locked_until >= ?
+              )
+            LIMIT 1
+            """,
+            (provider_id, model, now)
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT 1 FROM api_keys WHERE provider_id=? AND status='alive' LIMIT 1",
+            (provider_id,)
+        )
+    return bool(await cursor.fetchone())
+
+
 async def mark_key_used(key_id: str):
     db = await get_db()
     now = datetime_utc_now()
@@ -534,17 +683,20 @@ async def mark_key_used(key_id: str):
     await db.commit()
 
 
-def _model_lock_seconds(error_code: int, error_msg: str = ""):
-    if error_code in (429, 503, 529):
-        return 60
-    if error_code in (408, 500, 502, 504):
-        return 30
-    if error_code in (400, 404):
-        return 300
+def _stepped_cooldown_seconds(retry_count: int):
+    steps = (3, 5, 10)
+    return steps[min(max(retry_count - 1, 0), len(steps) - 1)]
+
+
+def _model_lock_seconds(error_code: int, error_msg: str = "", retry_count: int = 0):
     lowered = (error_msg or "").lower()
-    if "model" in lowered or "not found" in lowered or "unsupported" in lowered or "function" in lowered:
+    if error_code in (408, 429, 500, 502, 503, 504, 524, 529):
+        return _stepped_cooldown_seconds(retry_count)
+    if is_context_limit_error(error_code, error_msg):
         return 300
-    return 30
+    if error_code in (400, 404) or any(word in lowered for word in ("model", "not found", "unsupported", "function")):
+        return 300
+    return _stepped_cooldown_seconds(retry_count)
 
 
 def is_context_limit_error(error_code: int, error_msg: str = ""):
@@ -553,40 +705,63 @@ def is_context_limit_error(error_code: int, error_msg: str = ""):
     lowered = (error_msg or "").lower()
     needles = (
         "input token exceed",
+        "input tokens exceed",
+        "input token limit",
+        "max input tokens",
         "token exceed",
+        "tokens exceed",
         "context length",
         "context_length",
+        "context_length_exceeded",
+        "context window",
+        "context limit",
         "maximum context",
+        "maximum context length",
         "max context",
         "too many tokens",
+        "too many input tokens",
         "prompt is too long",
+        "prompt token count",
+        "exceeds the context",
+        "reduce the length",
         "request too large",
-        "quota_limit_reached",
     )
-    return any(needle in lowered for needle in needles)
+    if any(needle in lowered for needle in needles):
+        return True
+    return "quota_limit_reached" in lowered and any(
+        word in lowered for word in ("token", "tokens", "input", "prompt", "context")
+    )
 
 
 def _context_limit_sql_predicate(column: str):
     lowered = f"lower(coalesce({column}, ''))"
     return " OR ".join([
         f"{lowered} LIKE '%input token exceed%'",
+        f"{lowered} LIKE '%input tokens exceed%'",
+        f"{lowered} LIKE '%input token limit%'",
+        f"{lowered} LIKE '%max input tokens%'",
         f"{lowered} LIKE '%token exceed%'",
+        f"{lowered} LIKE '%tokens exceed%'",
         f"{lowered} LIKE '%context length%'",
         f"{lowered} LIKE '%context_length%'",
+        f"{lowered} LIKE '%context_length_exceeded%'",
+        f"{lowered} LIKE '%context window%'",
+        f"{lowered} LIKE '%context limit%'",
         f"{lowered} LIKE '%maximum context%'",
+        f"{lowered} LIKE '%maximum context length%'",
         f"{lowered} LIKE '%max context%'",
         f"{lowered} LIKE '%too many tokens%'",
+        f"{lowered} LIKE '%too many input tokens%'",
         f"{lowered} LIKE '%prompt is too long%'",
+        f"{lowered} LIKE '%prompt token count%'",
+        f"{lowered} LIKE '%exceeds the context%'",
+        f"{lowered} LIKE '%reduce the length%'",
         f"{lowered} LIKE '%request too large%'",
-        f"{lowered} LIKE '%quota_limit_reached%'",
     ])
 
 
 async def cleanup_context_limit_state(conn=None):
     database = conn or await get_db()
-    await database.execute(
-        f"DELETE FROM key_model_locks WHERE {_context_limit_sql_predicate('error')}"
-    )
     await database.execute(
         f"""
         UPDATE api_keys
@@ -596,6 +771,72 @@ async def cleanup_context_limit_state(conn=None):
     )
     if conn is None:
         await database.commit()
+
+
+# --- Periodic background cleanup ---
+# Previously ran inline in _list_alive_keys_impl, but opsi A moved hot reads to
+# the readonly variant which never executes UPDATEs. Keys in cooldown or with
+# expired model locks would stay stuck forever. This task runs cleanup every
+# 60s on its own connection so it never contends with request-path writes.
+_CLEANUP_INTERVAL_SECONDS = 60
+_cleanup_task: Optional[asyncio.Task] = None
+
+
+async def _run_periodic_cleanup_once() -> None:
+    """One cleanup sweep. Safe to call from background loop."""
+    db = await get_db()
+    now = datetime_utc_now()
+    await db.execute(
+        "UPDATE api_keys SET status='alive', cooldown_until=NULL "
+        "WHERE status='cooldown' AND cooldown_until IS NOT NULL AND cooldown_until < ?",
+        (now,),
+    )
+    await db.execute("DELETE FROM key_model_locks WHERE locked_until < ?", (now,))
+    await cleanup_context_limit_state(db)
+
+
+async def periodic_cleanup_loop(interval: int = _CLEANUP_INTERVAL_SECONDS) -> None:
+    """Background task: run cleanup every `interval` seconds until cancelled."""
+    # Stagger start so we don't fire at the same instant as startup commits
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await _run_periodic_cleanup_once()
+            logger.debug("Periodic cleanup sweep complete")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # OperationalError(locked) is fine — a request-path writer is mid-commit;
+            # next sweep will catch it. Don't kill the loop.
+            logger.warning("Periodic cleanup sweep failed (will retry): %s", e)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
+def start_periodic_cleanup(interval: int = _CLEANUP_INTERVAL_SECONDS) -> asyncio.Task:
+    """Spawn the periodic cleanup task. Idempotent — returns existing task if running."""
+    global _cleanup_task
+    if _cleanup_task is not None and not _cleanup_task.done():
+        return _cleanup_task
+    _cleanup_task = asyncio.create_task(periodic_cleanup_loop(interval))
+    logger.info("Periodic cleanup task started (interval=%ds)", interval)
+    return _cleanup_task
+
+
+async def stop_periodic_cleanup() -> None:
+    """Cancel the periodic cleanup task on shutdown."""
+    global _cleanup_task
+    if _cleanup_task is not None and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Periodic cleanup task raised on shutdown: %s", e)
+    _cleanup_task = None
 
 
 def _global_key_dead(error_code: int, error_msg: str = ""):
@@ -610,24 +851,32 @@ async def lock_key_model(key_id: str, model: str, error_code: int, error_msg: st
         return
     db = await get_db()
     from datetime import datetime, timedelta
-    locked_until = (datetime.utcnow() + timedelta(seconds=seconds or _model_lock_seconds(error_code, error_msg))).isoformat()
+    cursor = await db.execute(
+        "SELECT retry_count FROM key_model_locks WHERE key_id=? AND LOWER(model)=LOWER(?)",
+        (key_id, model)
+    )
+    row = await cursor.fetchone()
+    retry = (row["retry_count"] if row else 0) + 1
+
+    lock_seconds = seconds or _model_lock_seconds(error_code, error_msg, retry)
+    locked_until = (datetime.utcnow() + timedelta(seconds=lock_seconds)).isoformat()
     await db.execute(
-        "INSERT OR REPLACE INTO key_model_locks (key_id, model, locked_until, error_code, error) VALUES (?,?,?,?,?)",
-        (key_id, model, locked_until, error_code, (error_msg or "")[:500])
+        "INSERT OR REPLACE INTO key_model_locks (key_id, model, locked_until, error_code, error, retry_count) VALUES (?,?,?,?,?,?)",
+        (key_id, model, locked_until, error_code, (error_msg or "")[:500], retry)
     )
     await db.commit()
 
 
-async def mark_key_error(key_id: str, error_code: int, error_msg: str, model: str = None):
+async def mark_key_error(key_id: str, error_code: int, error_msg: str, model: str = None, provider_name: str = ""):
     db = await get_db()
     if is_context_limit_error(error_code, error_msg):
         await db.execute(
             "UPDATE api_keys SET status='alive', error_code=NULL, last_error=NULL, cooldown_until=NULL WHERE id=?",
             (key_id,),
         )
-        if model:
-            await db.execute("DELETE FROM key_model_locks WHERE key_id=? AND LOWER(model)=LOWER(?)", (key_id, model))
         await db.commit()
+        if model:
+            await lock_key_model(key_id, model, error_code, error_msg, seconds=300)
         return "alive"
     status = "alive"
     cooldown_until = None
@@ -660,6 +909,25 @@ async def clear_key_model_lock(key_id: str, model: str):
     db = await get_db()
     await db.execute("DELETE FROM key_model_locks WHERE key_id=? AND LOWER(model)=LOWER(?)", (key_id, model))
     await db.commit()
+
+
+async def get_key_locks(provider_id: str = None):
+    """Return all active key_model_locks for UI display."""
+    db = await get_db()
+    now = datetime_utc_now()
+    if provider_id:
+        cursor = await db.execute(
+            "SELECT l.* FROM key_model_locks l "
+            "JOIN api_keys k ON k.id=l.key_id "
+            "WHERE k.provider_id=? AND l.locked_until >= ?",
+            (provider_id, now)
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT l.* FROM key_model_locks l WHERE l.locked_until >= ?",
+            (now,)
+        )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 # --- Round-Robin Helpers ---
@@ -1021,23 +1289,24 @@ def _pricing_slug(model: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
-async def upsert_model_pricing(model_id: str, input_per_million: float, output_per_million: float, source: str = "manual"):
+async def upsert_model_pricing(model_id: str, input_per_million: float, output_per_million: float, source: str = "manual", context_window: int = 0):
     db = await get_db()
     model_key = _pricing_key(model_id)
     if not model_key:
         return None
     await db.execute(
         """
-        INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, source, updated_at)
-        VALUES (?,?,?,?,?,datetime('now'))
+        INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, context_window, source, updated_at)
+        VALUES (?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(model_key) DO UPDATE SET
           model_id=excluded.model_id,
           input_per_million=excluded.input_per_million,
           output_per_million=excluded.output_per_million,
+          context_window=excluded.context_window,
           source=excluded.source,
           updated_at=datetime('now')
         """,
-        (model_key, model_id, float(input_per_million or 0), float(output_per_million or 0), source),
+        (model_key, model_id, float(input_per_million or 0), float(output_per_million or 0), int(context_window or 0), source),
     )
     await db.commit()
     await recalculate_log_costs(model_id)
@@ -1057,7 +1326,14 @@ async def get_model_pricing(model: str):
         """
         SELECT * FROM model_pricing
         WHERE model_key LIKE ?
-        ORDER BY (input_per_million + output_per_million) ASC, model_key ASC
+        -- Prefer official 'openai/' prefix over random 'auto/' or other prefixes,
+        -- then cheapest variant. This makes bare 'gpt-5.3-codex' resolve to
+        -- the official 'openai/gpt-5.3-codex' pricing rather than any 'auto/'
+        -- routing wrapper.
+        ORDER BY
+          CASE WHEN model_key LIKE 'openai/%' THEN 0 ELSE 1 END ASC,
+          (input_per_million + output_per_million) ASC,
+          model_key ASC
         LIMIT 1
         """,
         (f"%/{model_key}",),
@@ -1071,6 +1347,10 @@ async def get_model_pricing(model: str):
         return None
     cursor = await db.execute("SELECT * FROM model_pricing")
     candidates = [dict(r) for r in await cursor.fetchall()]
+    # Slug exact match — also prefer openai/ prefix
+    openai_candidates = [c for c in candidates if (c.get("model_key") or "").startswith("openai/") and _pricing_slug(c.get("model_id")) == requested_slug]
+    if openai_candidates:
+        return min(openai_candidates, key=lambda c: float(c.get("input_per_million") or 0) + float(c.get("output_per_million") or 0))
     for candidate in candidates:
         if _pricing_slug(candidate.get("model_id")) == requested_slug:
             return candidate
@@ -1079,6 +1359,16 @@ async def get_model_pricing(model: str):
         if requested_slug in candidate_slug or candidate_slug in requested_slug:
             return candidate
     return None
+
+
+async def get_model_context_window(model: str) -> int:
+    pricing = await get_model_pricing(model)
+    if not pricing:
+        return 0
+    try:
+        return max(0, int(pricing.get("context_window") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 async def list_model_pricing(limit: int = 500):
@@ -1100,12 +1390,13 @@ async def sync_openrouter_pricing():
             continue
         await db.execute(
             """
-            INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, source, updated_at)
-            VALUES (?,?,?,?,?,datetime('now'))
+            INSERT INTO model_pricing (model_key, model_id, input_per_million, output_per_million, context_window, source, updated_at)
+            VALUES (?,?,?,?,?,?,datetime('now'))
             ON CONFLICT(model_key) DO UPDATE SET
               model_id=excluded.model_id,
               input_per_million=excluded.input_per_million,
               output_per_million=excluded.output_per_million,
+              context_window=excluded.context_window,
               source=excluded.source,
               updated_at=datetime('now')
             """,
@@ -1114,6 +1405,7 @@ async def sync_openrouter_pricing():
                 model_id,
                 float(row.get("input_per_million") or 0),
                 float(row.get("output_per_million") or 0),
+                int(row.get("context_window") or 0),
                 row.get("source") or "openrouter_catalog",
             ),
         )
@@ -1127,8 +1419,16 @@ async def calculate_model_cost(model: str, tokens_in: int, tokens_out: int):
     pricing = await get_model_pricing(model)
     if not pricing:
         return 0.0, 0.0, 0.0, ""
-    input_cost = (int(tokens_in or 0) / 1_000_000) * float(pricing.get("input_per_million") or 0)
-    output_cost = (int(tokens_out or 0) / 1_000_000) * float(pricing.get("output_per_million") or 0)
+    # Clamp negative token counts and negative pricing — guard against bogus
+    # upstream responses or stale pricing entries that would otherwise produce
+    # negative costs and skew dashboard aggregates (e.g. $-1458 from a single
+    # bad row dragging the entire daily total negative).
+    safe_in = max(0, int(tokens_in or 0))
+    safe_out = max(0, int(tokens_out or 0))
+    in_price = max(0.0, float(pricing.get("input_per_million") or 0))
+    out_price = max(0.0, float(pricing.get("output_per_million") or 0))
+    input_cost = (safe_in / 1_000_000) * in_price
+    output_cost = (safe_out / 1_000_000) * out_price
     total_cost = input_cost + output_cost
     return input_cost, output_cost, total_cost, pricing.get("source") or ""
 

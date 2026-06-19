@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { Activity, Braces, ChevronLeft, ChevronRight, Gauge, KeyRound, LayoutDashboard, Layers, LogOut, ScrollText, Server, Settings, Shield, Terminal } from 'lucide-react'
 import { logout } from './api'
+import UptimeHUD from './components/UptimeHUD'
 
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
@@ -24,6 +25,7 @@ export default function App() {
 
   return (
     <div className={`app-shell flex h-screen text-[var(--text)] ${sidebarOpen ? 'sidebar-open' : 'sidebar-collapsed'}`}>
+      <UptimeHUD />
       <aside className="app-sidebar">
         <div className="p-4 border-b border-[var(--line)]">
           <div className="flex items-center gap-3 min-w-0">
@@ -73,7 +75,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto hacker-grid">
         <div className="max-w-7xl mx-auto p-6">
           <Outlet />
         </div>

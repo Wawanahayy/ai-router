@@ -8,21 +8,29 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime
 
 app = FastAPI(title="AI Router", version="2.0.0")
 logger = logging.getLogger(__name__)
 pricing_sync_task = None
+SERVER_START_TIME = time.time()  # captured at module load → true service uptime
 PRICING_SYNC_INTERVAL = float(os.getenv("AI_ROUTER_PRICING_SYNC_INTERVAL", "60"))
 
 # CORS
+_cors_origins_raw = os.getenv("AI_ROUTER_CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()] if _cors_origins_raw else [
+    "http://localhost:32128",
+    "http://127.0.0.1:32128",
+    "http://0.0.0.0:32128",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # --- Auth helpers ---
 
@@ -79,7 +87,10 @@ async def check_proxy_auth(request: Request):
 @app.middleware("http")
 async def protect_management_api(request: Request, call_next):
     """Apply dashboard auth to management API routes when enabled."""
-    if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth/") and request.method != "OPTIONS":
+    path = request.url.path
+    # Public endpoints (no auth required — safe system metrics)
+    public_paths = ("/api/auth/", "/api/uptime", "/v1/health")
+    if path.startswith("/api/") and not any(path.startswith(p) for p in public_paths) and request.method != "OPTIONS":
         try:
             await check_dashboard_auth(request)
         except HTTPException as exc:
@@ -93,6 +104,7 @@ async def startup():
     await db.get_db()
     if PRICING_SYNC_INTERVAL > 0:
         pricing_sync_task = asyncio.create_task(pricing_sync_loop())
+    db.start_periodic_cleanup()
 
 
 @app.on_event("shutdown")
@@ -105,6 +117,7 @@ async def shutdown():
         except asyncio.CancelledError:
             pass
         pricing_sync_task = None
+    await db.stop_periodic_cleanup()
     await db.close_db()
 
 
@@ -125,6 +138,17 @@ async def pricing_sync_loop():
 async def v1_health():
     return {"ok": True, "service": "ai-router", "ts": int(time.time())}
 
+
+@app.get("/api/uptime")
+async def api_uptime():
+    """Real service uptime — captured at module import, survives until process restart."""
+    elapsed = int(time.time() - SERVER_START_TIME)
+    return {
+        "started_at": SERVER_START_TIME,
+        "uptime_seconds": elapsed,
+        "service": "ai-router",
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     local_key_id = await check_proxy_auth(request)
@@ -133,6 +157,18 @@ async def chat_completions(request: Request):
     if isinstance(result, dict) and "error" in result:
         return JSONResponse(result, status_code=status)
     if hasattr(result, '__call__'):  # SSE response
+        return result
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    local_key_id = await check_proxy_auth(request)
+    body = await request.json()
+    result, status = await proxy.proxy_responses(body, dict(request.headers), local_key_id)
+    if isinstance(result, dict) and "error" in result:
+        return JSONResponse(result, status_code=status)
+    if hasattr(result, "__call__"):
         return result
     return JSONResponse(result, status_code=status)
 
@@ -337,7 +373,31 @@ async def api_delete_provider_models(provider_id: str):
 
 @app.get("/api/keys")
 async def api_list_keys(provider_id: str = None, status: str = None):
-    return await db.list_keys(provider_id, status)
+    keys = await db.list_keys(provider_id, status)
+    # Attach lock info (model-specific cooldown) + remaining seconds
+    if provider_id:
+        locks = await db.get_key_locks(provider_id)
+    else:
+        locks = await db.get_key_locks()
+    lock_map = {}
+    now = datetime.utcnow()
+    for l in locks:
+        key_id = l["key_id"]
+        until = datetime.fromisoformat(l["locked_until"]) if isinstance(l["locked_until"], str) else l["locked_until"]
+        remaining = max(0, int((until - now).total_seconds()))
+        if key_id not in lock_map or remaining > lock_map[key_id]["remaining"]:
+            lock_map[key_id] = {
+                "model": l["model"],
+                "remaining": remaining,
+                "locked_until": l["locked_until"],
+                "error_code": l.get("error_code"),
+                "error": l.get("error", "")[:100],
+                "retry_count": l.get("retry_count", 0),
+            }
+    for k in keys:
+        if k["id"] in lock_map:
+            k["lock"] = lock_map[k["id"]]
+    return keys
 
 
 @app.post("/api/keys")
@@ -363,7 +423,17 @@ async def api_add_keys_bulk(request: Request):
 @app.put("/api/keys/{key_id}")
 async def api_update_key(key_id: str, request: Request):
     data = await request.json()
+    if "key" in data:
+        key_value = str(data.pop("key") or "").strip()
+        if not key_value:
+            raise HTTPException(400, "API key cannot be empty")
+        data["key_value"] = key_value
+        data["status"] = "alive"
+        data["cooldown_until"] = None
+        data["error_code"] = None
+        data["last_error"] = None
     await db.update_key(key_id, data)
+    proxy.invalidate_models_cache()
     return {"ok": True}
 
 
@@ -489,6 +559,7 @@ async def api_upsert_pricing(model_id: str, request: Request):
         data.get("input_per_million", 0),
         data.get("output_per_million", 0),
         data.get("source", "manual"),
+        data.get("context_window", 0),
     )
 
 

@@ -10,6 +10,7 @@ Canonical repository: https://github.com/Wawanahayy/ai-router
 AI Router is a self-hosted AI gateway. It exposes:
 
 - OpenAI-compatible chat completions at `/v1/chat/completions`
+- OpenAI Responses-compatible bridge at `/v1/responses`
 - Anthropic-compatible messages at `/v1/messages`
 - A web dashboard for providers, keys, models, combos, settings, and logs
 
@@ -26,6 +27,8 @@ ai_router/config.py              Runtime configuration from environment
 ai_router/db.py                  SQLite schema, migrations, settings, logs
 ai_router/proxy.py               Provider routing, fallback, request handling
 ai_router/server.py              FastAPI app, dashboard API, auth, static files
+ai_router/services/translator.py Request/response translation helpers
+ai_router/services/error_policy.py Upstream error classification and fallback policy
 ai_router/services/streaming.py  Streaming proxy behavior and timeout handling
 ai_router/static/                Built dashboard assets served by backend
 web/src/                         React dashboard source
@@ -33,6 +36,7 @@ web/src/api.js                   Dashboard API client
 run.py                           Backend entrypoint
 start.sh                         Linux helper script for setup/run/build
 import_keys.py                   Helper for importing provider keys
+key_edit.py                      Optional local helper for editing keys via localhost
 ```
 
 ## Development Rules
@@ -44,6 +48,9 @@ import_keys.py                   Helper for importing provider keys
 - Prefer existing database helper functions and API patterns before adding new abstractions.
 - For streaming changes, be careful with first-byte delays, heartbeat behavior, cancellation, and upstream timeouts.
 - For logging/token changes, make sure both streaming and non-streaming requests are accounted for.
+- For translation changes, keep OpenAI Chat, OpenAI Responses, and Anthropic Messages behavior aligned.
+- For error handling changes, update `ai_router/services/error_policy.py` instead of scattering new status checks across proxy code.
+- For combo/provider routing changes, preserve context-window filtering and tool-capability filtering.
 - For dashboard changes, update `web/src` first. Rebuild static assets only when needed for release.
 
 ## Setup Commands
@@ -98,7 +105,7 @@ For Cloudflare Tunnel deployment:
 Before finishing backend changes:
 
 ```bash
-python -m py_compile ai_router/config.py ai_router/db.py ai_router/proxy.py ai_router/server.py ai_router/services/streaming.py run.py import_keys.py
+python -m py_compile ai_router/config.py ai_router/db.py ai_router/proxy.py ai_router/server.py ai_router/services/translator.py ai_router/services/error_policy.py ai_router/services/streaming.py run.py import_keys.py
 ```
 
 Before finishing dashboard changes:
@@ -133,6 +140,7 @@ GET  /v1/health
 GET  /v1/models
 POST /v1/models
 POST /v1/chat/completions
+POST /v1/responses
 POST /v1/messages
 ```
 
@@ -140,6 +148,13 @@ OpenAI-compatible clients should call:
 
 ```text
 POST /v1/chat/completions
+Authorization: Bearer ar-your-local-key
+```
+
+OpenAI Responses-compatible clients should call:
+
+```text
+POST /v1/responses
 Authorization: Bearer ar-your-local-key
 ```
 
@@ -154,9 +169,32 @@ anthropic-version: 2023-06-01
 The local `ar-...` key belongs to AI Router. Upstream provider keys are stored
 inside AI Router and should never be exposed to clients.
 
+`/v1/responses` is currently a compatibility bridge. It converts Responses
+`input`, `instructions`, `tools`, and `max_output_tokens` into an internal chat
+completion request, then converts the chat response back to a Responses-shaped
+payload. Streaming Responses requests return a minimal SSE sequence:
+`response.created`, `response.completed`, and `[DONE]`.
+
 When creating upstream or local API keys, empty labels/names are auto-numbered
 as `apikey-1`, `apikey-2`, and so on. Bulk upstream key imports continue the
 same sequence for that provider.
+
+`key_edit.py` can edit upstream provider keys and local `ar-...` keys through
+the localhost admin API. It is useful when a provider key fails and the operator
+wants to replace it without opening the dashboard:
+
+```bash
+python key_edit.py --list
+python key_edit.py --id KEY_ID --key NEW_PROVIDER_KEY --label apikey-new --status alive
+python key_edit.py --local --id KEY_ID --key ar-new-local-key --name main --active 1
+```
+
+If dashboard auth is enabled, pass `--auth PASSWORD` or set
+`AI_ROUTER_ADMIN_TOKEN`.
+
+Note: files named `apikey*.*` are ignored by `.gitignore` to avoid accidental
+secret commits. If a helper script with this name must be committed, explicitly
+unignore that exact filename or rename it to a non-secret-looking name.
 
 Dashboard/admin API endpoints:
 
@@ -200,6 +238,9 @@ POST   /api/aliases/deactivate
 
 GET    /api/logs
 GET    /api/stats
+GET    /api/pricing
+POST   /api/pricing/sync-openrouter
+PUT    /api/pricing/{model_id}
 GET    /api/settings
 PUT    /api/settings
 
@@ -230,6 +271,70 @@ When editing streaming code, verify:
 - Final usage logging
 - OpenAI stream format
 - Anthropic stream format
+
+## Translation Notes
+
+The translation layer lives in `ai_router/services/translator.py`.
+
+It handles:
+
+- OpenAI chat message normalization
+- OpenAI tool call IDs and tool result repair
+- OpenAI Chat to Anthropic Messages conversion
+- Anthropic Messages to OpenAI Chat response conversion
+- OpenAI Responses bridge conversion
+- Forced tool-call synthesis when a provider returns JSON text for a forced tool
+
+Do not drop tool results silently. If a tool result cannot be matched to a prior
+assistant tool call, preserve it as user-visible content so coding agents can
+continue instead of looping.
+
+## Routing and Context Notes
+
+Provider/model selection should respect:
+
+- Alive upstream keys
+- Combo model order and round-robin behavior
+- Provider tool support when the request contains real tools or active tool choice
+- Provider streaming support when `stream: true`
+- Provider JSON mode support when `response_format` is present
+- Model context windows from the pricing catalog when available
+
+Context filtering estimates `input_tokens + max_tokens/max_completion_tokens`.
+If no context data is available for any model, the router should allow the
+request. If some combo models have context data and others do not, unknown
+models follow the lowest known context window to avoid routing large agent
+requests into small-context models.
+
+## Error Policy Notes
+
+Upstream error classification belongs in `ai_router/services/error_policy.py`.
+
+Known categories include:
+
+- `context_limit`
+- `quota_exhausted`
+- `rate_limited`
+- `overloaded`
+- `timeout`
+- `unsupported_model`
+- `auth_dead`
+- `upstream_error`
+
+The proxy uses this policy for OpenAI-compatible error responses, fallback
+decisions, and transient waits. When adding provider-specific errors such as
+unusual status codes, add the rule in `error_policy.py` and keep dashboard logs
+readable.
+
+## Logs and Pricing Notes
+
+Request logs store provider, key, model, status, latency, token counts, cost,
+raw error text, and fallback chain. The dashboard logs page can expand error
+details and fallback attempts.
+
+Pricing sync uses the official OpenRouter model catalog as a reference for
+cost and context windows. Model matching should handle provider prefixes by
+matching the normalized model suffix when exact IDs differ.
 
 ## Database Notes
 

@@ -1,6 +1,8 @@
 """Model listing and upstream model fetch helpers."""
 import logging
+import os
 import time
+from collections import OrderedDict
 
 import httpx
 
@@ -9,8 +11,34 @@ from .upstream import build_request, provider_format
 
 logger = logging.getLogger(__name__)
 
-_models_cache: dict = {}
+# Bounded LRU cache. Per-provider upstream /models responses are stored
+# here and evicted in insertion order once we exceed the size cap.
+_models_cache: "OrderedDict[str, dict]" = OrderedDict()
 _MODELS_CACHE_TTL = 300
+_MODELS_CACHE_MAX = max(1, int(os.getenv("AI_ROUTER_MODELS_CACHE_MAX", "64")))
+
+
+def _cache_get(provider_id: str):
+    """Return cached entry, mark as recently used. Returns None if absent/expired."""
+    now = time.time()
+    entry = _models_cache.get(provider_id)
+    if not entry:
+        return None
+    if (now - entry["fetched_at"]) >= _MODELS_CACHE_TTL:
+        _models_cache.pop(provider_id, None)
+        return None
+    _models_cache.move_to_end(provider_id)
+    return entry
+
+
+def _cache_put(provider_id: str, upstream_models: list):
+    """Store upstream models with LRU eviction."""
+    now = time.time()
+    _models_cache[provider_id] = {"data": upstream_models, "fetched_at": now}
+    _models_cache.move_to_end(provider_id)
+    while len(_models_cache) > _MODELS_CACHE_MAX:
+        evicted_id, _ = _models_cache.popitem(last=False)
+        logger.debug("Models cache evicted provider_id=%s (size cap=%d)", evicted_id, _MODELS_CACHE_MAX)
 
 
 def invalidate_models_cache(provider_id: str = None):
@@ -19,6 +47,7 @@ def invalidate_models_cache(provider_id: str = None):
         _models_cache.pop(provider_id, None)
     else:
         _models_cache.clear()
+    return {"cleared": 1 if provider_id else len(_models_cache), "max": _MODELS_CACHE_MAX}
 
 
 def get_effective_prefix(provider: dict) -> str:
@@ -57,9 +86,8 @@ async def proxy_models(provider_id: str = None):
         try:
             key = await db.get_alive_key(p["id"])
             if key and provider_format(p) != "anthropic-compatible":
-                now = time.time()
-                cached = _models_cache.get(p["id"])
-                if cached and (now - cached["fetched_at"]) < _MODELS_CACHE_TTL:
+                cached = _cache_get(p["id"])
+                if cached is not None:
                     upstream_models = cached["data"]
                 else:
                     req = build_request(p, "models", key["key_value"])
@@ -68,7 +96,7 @@ async def proxy_models(provider_id: str = None):
                     if resp.status_code == 200:
                         data = resp.json()
                         upstream_models = data.get("data", [])
-                        _models_cache[p["id"]] = {"data": upstream_models, "fetched_at": now}
+                        _cache_put(p["id"], upstream_models)
                     else:
                         upstream_models = []
 

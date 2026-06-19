@@ -4,16 +4,17 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import httpx
 from starlette.responses import StreamingResponse
 
 from .. import db
+from . import error_policy
 
 logger = logging.getLogger(__name__)
 
 STREAM_CONNECT_TIMEOUT = float(os.getenv("AI_ROUTER_STREAM_CONNECT_TIMEOUT", "20"))
-# Deprecated: first-byte timeouts cut off slow reasoning/thinking models after
 # the upstream has accepted the request. Keep the env var ignored for backwards
 # compatibility and rely on raw-byte stall detection instead.
 STREAM_FIRST_BYTE_TIMEOUT = 0
@@ -27,7 +28,8 @@ def _timeout_value(seconds: float):
 
 
 def _rate_limit_wait_seconds(attempt_count: int):
-    return min(2 ** min(max(attempt_count - 1, 0), 3), 8)
+    steps = (3, 5, 10)
+    return steps[min(max(attempt_count - 1, 0), len(steps) - 1)]
 
 
 def _estimate_input_tokens(body: dict) -> int:
@@ -48,6 +50,27 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
     stream_state = {"model": model, "provider_type": provider_type}
     token_state = {"in": 0, "out": 0, "estimated": False}
     output_state = {"chars": 0}
+    content_state = {"content": False, "tools": False, "reasoning": "", "text_buffer": ""}
+    tool_state = {"calls": {}}
+    openai_tool_state = {"calls": {}}
+    openai_text_state = {"hold": False, "buffer": ""}
+
+    _ANTHROPIC_EVENT_TYPES = {
+        "message_start", "message_delta", "message_stop", "ping",
+        "content_block_start", "content_block_delta", "content_block_stop",
+    }
+
+    def _looks_like_anthropic_event(line: str) -> bool:
+        stripped = line.strip()
+        if stripped.startswith("data:"):
+            stripped = stripped[5:].strip()
+        if not stripped.startswith("{"):
+            return False
+        try:
+            obj = json.loads(stripped)
+        except Exception:
+            return False
+        return isinstance(obj, dict) and obj.get("type") in _ANTHROPIC_EVENT_TYPES
 
     def update_usage(usage):
         if not isinstance(usage, dict):
@@ -65,10 +88,16 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         if token_state["in"] or token_state["out"]:
             token_state["estimated"] = False
 
+    def request_has_tools(request_body: dict | None) -> bool:
+        return isinstance(request_body, dict) and any(
+            key in request_body
+            for key in ("tools", "tool_choice", "functions", "function_call")
+        )
+
     def track_delta_text(delta):
         if not isinstance(delta, dict):
             return
-        for key in ("content", "reasoning_content"):
+        for key in ("content",):
             value = delta.get(key)
             if isinstance(value, str):
                 output_state["chars"] += len(value)
@@ -82,18 +111,70 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
 
     def error_chunk(message: str):
         payload = {
-            "id": "chatcmpl-ai-router-error",
-            "object": "chat.completion.chunk",
-            "model": stream_state["model"],
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": f"[ai-router] {message}"},
-                    "finish_reason": "stop",
-                }
-            ],
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message or "Upstream request failed",
+            },
         }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode()
+        return f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode()
+
+    def accumulate_openai_tool_calls(tool_calls):
+        if not isinstance(tool_calls, list):
+            return False
+        saw_tool = False
+        for fallback_index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            index = tool_call.get("index")
+            if not isinstance(index, int):
+                index = fallback_index
+            state = openai_tool_state["calls"].setdefault(index, {
+                "index": index,
+                "id": None,
+                "type": "function",
+                "name": "",
+                "arguments": "",
+            })
+            if tool_call.get("id"):
+                state["id"] = tool_call.get("id")
+            if tool_call.get("type"):
+                state["type"] = tool_call.get("type")
+            function = tool_call.get("function") or {}
+            if isinstance(function, dict):
+                name = function.get("name")
+                if isinstance(name, str) and name:
+                    if not state["name"] or name.startswith(state["name"]):
+                        state["name"] = name
+                    elif not state["name"].endswith(name):
+                        state["name"] += name
+                arguments = function.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    if not state["arguments"] or arguments.startswith(state["arguments"]):
+                        state["arguments"] = arguments
+                    else:
+                        state["arguments"] += arguments
+            saw_tool = True
+        if saw_tool:
+            content_state["tools"] = True
+        return saw_tool
+
+    def pop_openai_tool_calls():
+        calls = []
+        keys = sorted(openai_tool_state["calls"].keys(), key=lambda value: (not isinstance(value, int), str(value)))
+        for index in keys:
+            state = openai_tool_state["calls"][index]
+            calls.append({
+                "index": state.get("index", index),
+                "id": state.get("id") or f"call_{index}",
+                "type": state.get("type") or "function",
+                "function": {
+                    "name": state.get("name") or "tool",
+                    "arguments": state.get("arguments") or "{}",
+                },
+            })
+        openai_tool_state["calls"] = {}
+        return calls
 
     def has_valuable_delta(payload: dict) -> bool:
         choices = payload.get("choices")
@@ -106,7 +187,6 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         return bool(
             delta.get("role")
             or delta.get("content")
-            or delta.get("reasoning_content")
             or delta.get("tool_calls")
             or choice.get("finish_reason")
         )
@@ -124,10 +204,49 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             for choice in payload.get("choices") or []:
                 if isinstance(choice, dict):
                     choice.pop("content_filter_results", None)
-                    message = choice.get("message") or choice.get("delta") or {}
+                    message_key = "message" if isinstance(choice.get("message"), dict) else "delta"
+                    message = choice.get(message_key)
+                    if not isinstance(message, dict):
+                        message = {}
+                        choice[message_key] = message
                     track_delta_text(message)
+                    if openai_text_state["hold"] and isinstance(message.get("content"), str):
+                        openai_text_state["buffer"] += message.get("content") or ""
+                        message.pop("content", None)
+                    if message.get("tool_calls"):
+                        accumulate_openai_tool_calls(message.get("tool_calls"))
+                        message.pop("tool_calls", None)
+                    _fr_map = {
+                        "stop_sequence": "stop",
+                        "tool_use": "tool_calls",
+                        "max_tokens": "length",
+                        "content_filter": "content_filter",
+                        "refusal": "content_filter",
+                        "end_turn": "stop",
+                    }
+                    if choice.get("finish_reason") in _fr_map:
+                        choice["finish_reason"] = _fr_map[choice["finish_reason"]]
+                    if choice.get("finish_reason") and openai_tool_state["calls"]:
+                        full_tool_calls = pop_openai_tool_calls()
+                        if full_tool_calls:
+                            openai_text_state["buffer"] = ""
+                            message["tool_calls"] = full_tool_calls
+                            choice["finish_reason"] = "tool_calls"
+                            for tc in full_tool_calls:
+                                logger.info(
+                                    "SSE tool_call id=%s name=%s",
+                                    tc.get("id"),
+                                    (tc.get("function") or {}).get("name"),
+                                )
                     if message.get("tool_calls") and choice.get("finish_reason") not in (None, "tool_calls"):
                         choice["finish_reason"] = "tool_calls"
+                    if choice.get("finish_reason"):
+                        if choice.get("finish_reason") == "tool_calls" and message.get("tool_calls"):
+                            message.pop("content", None)
+                            openai_text_state["buffer"] = ""
+                        elif openai_text_state["hold"] and openai_text_state["buffer"]:
+                            message["content"] = openai_text_state["buffer"]
+                            openai_text_state["buffer"] = ""
             if not has_valuable_delta(payload):
                 return None
         return payload
@@ -166,13 +285,12 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 message = first.get("message")
                 if isinstance(message, dict):
                     chunks = []
-                    if message.get("content"):
+                    has_tool_calls = bool(message.get("tool_calls"))
+                    if message.get("content") and not has_tool_calls:
                         chunks.append(openai_stream_chunk({"content": message["content"]}))
-                    if message.get("reasoning_content"):
-                        chunks.append(openai_stream_chunk({"reasoning_content": message["reasoning_content"]}))
-                    if message.get("tool_calls"):
+                    if has_tool_calls:
                         chunks.append(openai_stream_chunk({"tool_calls": message["tool_calls"]}))
-                    finish_reason = "tool_calls" if message.get("tool_calls") else first.get("finish_reason") or "stop"
+                    finish_reason = "tool_calls" if has_tool_calls else first.get("finish_reason") or "stop"
                     chunks.append(openai_stream_chunk({}, finish_reason))
                     return b"".join(chunks), False
 
@@ -191,26 +309,49 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
 
         if stream_state["provider_type"] == "anthropic-compatible" and payload.get("type") == "message":
             update_usage(payload.get("usage"))
-            for part in payload.get("content") or []:
+            text_chunks = []
+            tool_chunks = []
+            saw_tool = False
+            reasoning_parts = []
+            for idx, part in enumerate(payload.get("content") or []):
                 if not isinstance(part, dict):
                     continue
                 if part.get("type") == "text" and part.get("text"):
                     output_state["chars"] += len(part["text"])
-                    yield openai_stream_chunk({"content": part["text"]})
+                    text_chunks.append(openai_stream_chunk({"content": part["text"]}))
                 elif part.get("type") == "tool_use":
                     output_state["chars"] += len(json.dumps(part.get("input") or {}, ensure_ascii=False))
-                    yield openai_stream_chunk({
+                    saw_tool = True
+                    tool_chunks.append(openai_stream_chunk({
                         "tool_calls": [{
-                            "index": 0,
-                            "id": part.get("id") or "call_0",
+                            "index": idx,
+                            "id": part.get("id") or f"call_{idx}_{abs(hash(json.dumps(part.get('input') or {}, sort_keys=True, default=str))) % 100000}",
                             "type": "function",
                             "function": {
                                 "name": part.get("name") or "tool",
                                 "arguments": json.dumps(part.get("input") or {}, ensure_ascii=False),
                             },
                         }]
-                    })
-            finish_reason = "tool_calls" if payload.get("stop_reason") == "tool_use" else payload.get("stop_reason") or "stop"
+                    }))
+                elif part.get("type") in ("thinking", "redacted_thinking"):
+                    reasoning = part.get("thinking") or part.get("data") or part.get("text") or ""
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+            if saw_tool:
+                for chunk in tool_chunks:
+                    yield chunk
+            else:
+                for chunk in text_chunks:
+                    yield chunk
+            if not text_chunks and not saw_tool and reasoning_parts:
+                reasoning_content = "".join(reasoning_parts)
+                output_state["chars"] += len(reasoning_content)
+                yield openai_stream_chunk({"content": reasoning_content})
+            finish_reason = {
+                "stop_sequence": "stop",
+                "tool_use": "tool_calls",
+                "max_tokens": "length",
+            }.get(payload.get("stop_reason"), payload.get("stop_reason") or "stop")
             yield openai_stream_chunk({}, finish_reason)
             yield b"data: [DONE]\n\n"
             return
@@ -223,16 +364,14 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
 
         first = choices[0] if isinstance(choices[0], dict) else {}
         message = first.get("message") or first.get("delta") or {}
-        if message.get("content"):
+        has_tool_calls = bool(message.get("tool_calls"))
+        if message.get("content") and not has_tool_calls:
             output_state["chars"] += len(message["content"])
             yield openai_stream_chunk({"content": message["content"]})
-        if message.get("reasoning_content"):
-            output_state["chars"] += len(message["reasoning_content"])
-            yield openai_stream_chunk({"reasoning_content": message["reasoning_content"]})
-        if message.get("tool_calls"):
+        if has_tool_calls:
             output_state["chars"] += len(json.dumps(message["tool_calls"], ensure_ascii=False))
             yield openai_stream_chunk({"tool_calls": message["tool_calls"]})
-        finish_reason = "tool_calls" if message.get("tool_calls") else first.get("finish_reason") or "stop"
+        finish_reason = "tool_calls" if has_tool_calls else first.get("finish_reason") or "stop"
         yield openai_stream_chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
 
@@ -251,6 +390,49 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             }],
         }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+    def buffer_or_emit_text(text: str):
+        if not text:
+            return None
+        output_state["chars"] += len(text)
+        if openai_text_state["hold"]:
+            content_state["text_buffer"] += text
+            return None
+        content_state["content"] = True
+        return openai_stream_chunk({"content": text})
+
+    def flush_buffered_text_if_no_tools():
+        if content_state["tools"] or not content_state["text_buffer"]:
+            content_state["text_buffer"] = ""
+            return None
+        text = content_state["text_buffer"]
+        content_state["text_buffer"] = ""
+        content_state["content"] = True
+        return openai_stream_chunk({"content": text})
+
+    def pop_anthropic_tool_chunks(index=None):
+        chunks = []
+        if index is None:
+            keys = sorted(tool_state["calls"].keys(), key=lambda value: (not isinstance(value, int), str(value)))
+        else:
+            keys = [index] if index in tool_state["calls"] else []
+        for key in keys:
+            state = tool_state["calls"].get(key) or {}
+            if state.get("emitted"):
+                continue
+            state["emitted"] = True
+            chunks.append(openai_stream_chunk({
+                "tool_calls": [{
+                    "index": key if isinstance(key, int) else state.get("index", 0),
+                    "id": state.get("id") or f"call_{key}",
+                    "type": "function",
+                    "function": {
+                        "name": state.get("name") or "tool",
+                        "arguments": state.get("arguments") or "{}",
+                    },
+                }]
+            }))
+        return chunks
 
     def normalize_anthropic_sse_line(line: str):
         stripped = line.strip()
@@ -273,55 +455,95 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         if event_type == "content_block_start":
             index = payload.get("index", 0)
             block = payload.get("content_block") or {}
-            if block.get("type") == "tool_use":
-                return openai_stream_chunk({
-                    "tool_calls": [{
-                        "index": index,
-                        "id": block.get("id") or f"call_{index}",
-                        "type": "function",
-                        "function": {
-                            "name": block.get("name") or "tool",
-                            "arguments": "",
-                        },
-                    }]
-                }), False
-            if block.get("type") == "text" and block.get("text"):
-                output_state["chars"] += len(block["text"])
-                return openai_stream_chunk({"content": block["text"]}), False
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                content_state["tools"] = True
+                content_state["text_buffer"] = ""
+                tool_state["calls"][index] = {
+                    "index": index,
+                    "id": block.get("id") or f"call_{index}",
+                    "name": block.get("name") or "tool",
+                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    "emitted": False,
+                }
+                output_state["chars"] += len(tool_state["calls"][index]["arguments"])
+                return None, False
+            if block_type == "text" and block.get("text"):
+                return buffer_or_emit_text(block["text"]), False
+            if block_type in ("thinking", "redacted_thinking"):
+                thought = block.get("thinking") or block.get("text") or block.get("data") or ""
+                if isinstance(thought, str) and thought:
+                    content_state["reasoning"] += thought
+                return None, False
             return None, False
         if event_type == "content_block_delta":
             index = payload.get("index", 0)
             delta = payload.get("delta") or {}
-            if delta.get("type") == "text_delta" and delta.get("text"):
-                output_state["chars"] += len(delta["text"])
-                return openai_stream_chunk({"content": delta["text"]}), False
-            if delta.get("type") == "input_json_delta" and delta.get("partial_json"):
+            delta_type = delta.get("type")
+            if delta_type == "text_delta" and delta.get("text"):
+                return buffer_or_emit_text(delta["text"]), False
+            if delta_type == "input_json_delta" and delta.get("partial_json"):
+                content_state["tools"] = True
+                content_state["text_buffer"] = ""
+                state = tool_state["calls"].setdefault(index, {
+                    "index": index,
+                    "id": f"call_{index}",
+                    "name": "tool",
+                    "arguments": "",
+                    "emitted": False,
+                })
+                state["arguments"] = (state.get("arguments") or "") + delta["partial_json"]
                 output_state["chars"] += len(delta["partial_json"])
-                return openai_stream_chunk({
-                    "tool_calls": [{
-                        "index": index,
-                        "function": {"arguments": delta["partial_json"]},
-                    }]
-                }), False
-            if delta.get("type") == "thinking_delta" and delta.get("thinking"):
-                output_state["chars"] += len(delta["thinking"])
-                return openai_stream_chunk({"reasoning_content": delta["thinking"]}), False
+                return None, False
+            if delta_type == "thinking_delta" and delta.get("thinking"):
+                content_state["reasoning"] += delta["thinking"]
+                return None, False
+            return None, False
+        if event_type == "content_block_stop":
+            index = payload.get("index", 0)
+            chunks = pop_anthropic_tool_chunks(index)
+            if chunks:
+                return b"".join(chunks), False
             return None, False
         if event_type == "message_delta":
             delta = payload.get("delta") or {}
             update_usage(payload.get("usage"))
             stop_reason = delta.get("stop_reason")
             if stop_reason:
-                finish_reason = "tool_calls" if stop_reason == "tool_use" else stop_reason
-                return openai_stream_chunk({}, finish_reason), False
+                finish_reason = {
+                    "end_turn": "stop",
+                    "stop_sequence": "stop",
+                    "tool_use": "tool_calls",
+                    "max_tokens": "length",
+                }.get(stop_reason, stop_reason or "stop")
+                chunks = []
+                if content_state["tools"] or tool_state["calls"]:
+                    content_state["text_buffer"] = ""
+                    chunks.extend(pop_anthropic_tool_chunks())
+                    finish_reason = "tool_calls"
+                else:
+                    flushed = flush_buffered_text_if_no_tools()
+                    if flushed:
+                        chunks.append(flushed)
+                    if not content_state["content"] and content_state["reasoning"]:
+                        output_state["chars"] += len(content_state["reasoning"])
+                        content_state["content"] = True
+                        chunks.append(openai_stream_chunk({"content": content_state["reasoning"]}))
+                chunks.append(openai_stream_chunk({}, finish_reason))
+                return b"".join(chunks), False
             return None, False
         if event_type == "message_stop":
-            return b"data: [DONE]\n\n", True
+            chunks = []
+            if not content_state["tools"]:
+                flushed = flush_buffered_text_if_no_tools()
+                if flushed:
+                    chunks.append(flushed)
+            chunks.append(b"data: [DONE]\n\n")
+            return b"".join(chunks), True
         if event_type == "error":
             error = payload.get("error") or {}
             return error_chunk(error.get("message") or json.dumps(payload, ensure_ascii=False)), True
         return None, False
-
     async def byte_generator():
         stream_timeout = httpx.Timeout(
             connect=STREAM_CONNECT_TIMEOUT,
@@ -358,6 +580,14 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 token_state["out"] = 0
                 token_state["estimated"] = False
                 output_state["chars"] = 0
+                content_state["content"] = False
+                content_state["tools"] = False
+                content_state["reasoning"] = ""
+                content_state["text_buffer"] = ""
+                tool_state["calls"] = {}
+                openai_tool_state["calls"] = {}
+                openai_text_state["hold"] = request_has_tools(attempt.get("body"))
+                openai_text_state["buffer"] = ""
                 current_start = time.time()
 
                 async def record_stream_opened():
@@ -396,21 +626,31 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                     )
                     if attempt.get("local_key_id"):
                         await db.mark_local_key_used(attempt["local_key_id"], tokens_in + tokens_out)
+                    if (attempt.get("body") or {}).get("tools") or content_state["tools"]:
+                        tool_arg_chars = sum(len(state.get("arguments") or "") for state in tool_state["calls"].values())
+                        logger.info(
+                            "Tool stream provider=%s model=%s tool_calls=%s tool_arg_chars=%s content=%s",
+                            attempt.get("provider_name") or attempt.get("provider_id"),
+                            attempt["model"],
+                            len(tool_state["calls"]),
+                            tool_arg_chars,
+                            content_state["content"],
+                        )
 
                 try:
                     async with client.stream("POST", attempt["url"], headers=attempt["headers"], json=attempt["body"]) as resp:
                         if resp.status_code >= 400:
                             error_text = await resp.aread()
-                            error_msg = error_text.decode(errors="replace")[:500]
+                            error_msg = error_policy._sanitize_error(error_text.decode(errors="replace")[:2000], status_code=resp.status_code)
                             await db.mark_key_error(attempt["key_id"], resp.status_code, error_msg, attempt["model"])
                             latency = int((time.time() - current_start) * 1000)
                             await db.add_log(attempt["provider_id"], attempt["key_id"], attempt["model"], 0, 0, latency, resp.status_code, error_msg, attempt.get("local_key_id"))
-                            last_error = f"Upstream returned {resp.status_code}: {error_msg}"
+                            last_error = error_msg[:200]
                             if index < len(attempts) - 1:
                                 next_group = attempts[index + 1].get("group")
                                 if resp.status_code == 429 and next_group != attempt.get("group"):
                                     await asyncio.sleep(_rate_limit_wait_seconds(index + 1))
-                                elif next_group != attempt.get("group") and resp.status_code in (502, 503, 504) and STREAM_TRANSIENT_WAIT > 0:
+                                elif next_group != attempt.get("group") and resp.status_code in (502, 503, 504, 524) and STREAM_TRANSIENT_WAIT > 0:
                                     await asyncio.sleep(STREAM_TRANSIENT_WAIT)
                                 continue
                             yield error_chunk(last_error)
@@ -452,6 +692,9 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                             buffer += chunk.decode(errors="replace")
                             while "\n" in buffer:
                                 line, buffer = buffer.split("\n", 1)
+                                if current_type != "anthropic-compatible" and _looks_like_anthropic_event(line):
+                                    current_type = "anthropic-compatible"
+                                    stream_state["provider_type"] = current_type
                                 if current_type == "anthropic-compatible":
                                     output, is_done = normalize_anthropic_sse_line(line)
                                 else:
@@ -469,6 +712,9 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                                 return
 
                         if buffer.strip():
+                            if current_type != "anthropic-compatible" and _looks_like_anthropic_event(buffer):
+                                current_type = "anthropic-compatible"
+                                stream_state["provider_type"] = current_type
                             if current_type == "anthropic-compatible":
                                 output, is_done = normalize_anthropic_sse_line(buffer)
                             else:
@@ -503,11 +749,15 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                         timeout_msg,
                     )
                     last_error = f"Upstream {timeout_msg.lower()}"
+                    # Only fall back if we haven't committed bytes to the
+                    # client yet (avoids corrupting the SSE response) AND the
+                    # next attempt is a different group (different provider —
+                    # same provider is likely having the same outage).
                     if not emitted and index < len(attempts) - 1:
                         next_group = attempts[index + 1].get("group")
                         if next_group != attempt.get("group") and STREAM_TRANSIENT_WAIT > 0:
                             await asyncio.sleep(STREAM_TRANSIENT_WAIT)
-                        continue
+                            continue
                     yield error_chunk(last_error)
                     return
                 except asyncio.CancelledError:
@@ -524,7 +774,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                     raise
                 except Exception as e:
                     latency = int((time.time() - current_start) * 1000)
-                    error_msg = str(e)[:500]
+                    error_msg = error_policy._sanitize_error(str(e)[:2000], status_code=500)
                     await db.add_log(attempt["provider_id"], attempt["key_id"], attempt["model"], 0, 0, latency, 500, error_msg, attempt.get("local_key_id"))
                     last_error = error_msg
                     if not emitted and index < len(attempts) - 1:
@@ -543,3 +793,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             "X-Accel-Buffering": "no",
         },
     ), 200
+
+
+
+

@@ -10,11 +10,19 @@
   --text: #e7edf4;
   --muted: #8c98a8;
   --faint: #596474;
-  --teal: #2dd4bf;
-  --blue: #60a5fa;
+  --teal: #22c55e;
+  --blue: #4ade80;
   --amber: #f59e0b;
   --red: #ef4444;
   --green: #22c55e;
+
+  /* Hacker dashboard palette */
+  --grid: rgba(34, 197, 94, 0.15);
+  --glow: rgba(34, 197, 94, 0.08);
+  --scanline: #2dd4bf;
+  --status-ok: #22c55e;
+  --status-warn: #f59e0b;
+  --status-dead: #ef4444;
 }
 
 * {
@@ -45,8 +53,137 @@ body::before {
   mask-image: linear-gradient(to bottom, black, transparent 70%);
 }
 
+/* Hacker-style dashboard background — green grid + radial halo + scanline + beam.
+   Apply to a container (e.g. <main>) to scope it to the main content area. */
+.hacker-grid {
+  position: relative;
+  background:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    radial-gradient(circle at center, var(--glow), transparent 55%),
+    #0a0a0a;
+  background-size: 32px 32px, 32px 32px, 100% 100%;
+}
+
+/* Horizontal scanner beam — slow up/down through the viewport center.
+   Classic SOC / NOC / sci-fi HUD element. */
+.hacker-grid::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(45, 212, 191, 0.45) 15%,
+    var(--scanline) 50%,
+    rgba(45, 212, 191, 0.45) 85%,
+    transparent 100%
+  );
+  box-shadow:
+    0 0 14px var(--scanline),
+    0 0 32px rgba(45, 212, 191, 0.45),
+    0 0 56px rgba(45, 212, 191, 0.18);
+  opacity: 0.85;
+  transform: translateY(0);
+  animation: beam 12s ease-in-out infinite alternate;
+  pointer-events: none;
+  z-index: 4;
+}
+
+@keyframes beam {
+  from { transform: translateY(-28vh); }
+  to { transform: translateY(28vh); }
+}
+
+.hacker-grid::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  height: 3px;
+  background: var(--scanline);
+  box-shadow:
+    0 0 12px var(--scanline),
+    0 0 36px rgba(45, 212, 191, 0.6),
+    0 0 64px rgba(45, 212, 191, 0.25);
+  opacity: 0.9;
+  animation: scan 6s ease-in-out infinite alternate;
+  pointer-events: none;
+  z-index: 5;
+}
+
+@keyframes scan {
+  from { transform: translateY(0); }
+  to { transform: translateY(100%); }
+}
+
+.hud-text {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  border: 1px solid rgba(45, 212, 191, 0.35);
+  border-radius: 999px;
+  background: rgba(10, 10, 10, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  color: #2dd4bf;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-shadow: 0 0 8px rgba(45, 212, 191, 0.55);
+  box-shadow:
+    0 0 16px rgba(45, 212, 191, 0.12),
+    inset 0 0 12px rgba(45, 212, 191, 0.06);
+  z-index: 50;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+}
+
+.hud-text .hud-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-ok);
+  box-shadow: 0 0 8px var(--status-ok), 0 0 14px rgba(34, 197, 94, 0.5);
+  animation: hud-pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.hud-text .hud-dot--dead {
+  background: var(--status-dead);
+  box-shadow: 0 0 8px var(--status-dead), 0 0 14px rgba(239, 68, 68, 0.5);
+  animation: none;
+}
+
+.hud-text .hud-label {
+  color: rgba(45, 212, 191, 0.75);
+  font-weight: 600;
+}
+
+.hud-text .hud-value {
+  color: #2dd4bf;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  min-width: 7ch;
+  text-align: right;
+}
+
+@keyframes hud-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.78); }
+}
+
 ::selection {
-  background: rgba(45, 212, 191, 0.28);
+  background: rgba(34, 197, 94, 0.28);
 }
 
 button,
@@ -225,8 +362,8 @@ button {
 }
 
 .input:focus {
-  border-color: rgba(45, 212, 191, 0.72);
-  box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.1);
+  border-color: rgba(34, 197, 94, 0.72);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.1);
 }
 
 .input::placeholder {
@@ -734,8 +871,8 @@ pre,
   inset: 0;
   pointer-events: none;
   background:
-    linear-gradient(90deg, transparent 0 92%, rgba(45,212,191,0.08) 92% 93%, transparent 93%),
-    repeating-linear-gradient(180deg, rgba(96,165,250,0.04) 0 1px, transparent 1px 22px);
+    linear-gradient(90deg, transparent 0 92%, rgba(34,197,94,0.08) 92% 93%, transparent 93%),
+    repeating-linear-gradient(180deg, rgba(34, 197, 94, 0.05) 0 1px, transparent 1px 22px);
   opacity: 0.75;
 }
 
@@ -746,7 +883,7 @@ pre,
   left: 1rem;
   right: 1rem;
   bottom: 1rem;
-  color: rgba(96, 165, 250, 0.15);
+  color: rgba(34, 197, 94, 0.18);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 0.67rem;
   line-height: 1.8;
