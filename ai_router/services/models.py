@@ -56,6 +56,69 @@ def get_effective_prefix(provider: dict) -> str:
     return ""
 
 
+def _model_id_from_item(item):
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("id", "name", "model", "model_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def normalize_models_payload(data) -> list[dict]:
+    """Normalize OpenAI/Anthropic-compatible model list shapes."""
+    if isinstance(data, dict):
+        items = data.get("data")
+        if items is None:
+            items = data.get("models")
+        if items is None:
+            items = data.get("model_list")
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    if not isinstance(items, list):
+        return []
+
+    models = []
+    seen = set()
+    for item in items:
+        mid = _model_id_from_item(item)
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        models.append({
+            "id": mid,
+            "created": item.get("created", 0) if isinstance(item, dict) else 0,
+        })
+    return models
+
+
+async def _fetch_models_from_upstream(provider: dict, key: dict, timeout: float = 15.0) -> list[dict]:
+    req = build_request(provider, "models", key["key_value"])
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(req["url"], headers=req["headers"])
+    if resp.status_code != 200:
+        logger.warning(
+            "Failed to fetch upstream models provider=%s format=%s status=%s body=%s",
+            provider.get("id"),
+            provider_format(provider),
+            resp.status_code,
+            resp.text[:300],
+        )
+        return []
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("Invalid upstream models JSON provider=%s body=%s", provider.get("id"), resp.text[:300])
+        return []
+    return normalize_models_payload(data)
+
+
 async def proxy_models(provider_id: str = None):
     """List available models."""
     if provider_id:
@@ -85,20 +148,13 @@ async def proxy_models(provider_id: str = None):
 
         try:
             key = await db.get_alive_key(p["id"])
-            if key and provider_format(p) != "anthropic-compatible":
+            if key:
                 cached = _cache_get(p["id"])
                 if cached is not None:
                     upstream_models = cached["data"]
                 else:
-                    req = build_request(p, "models", key["key_value"])
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        resp = await client.get(req["url"], headers=req["headers"])
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        upstream_models = data.get("data", [])
-                        _cache_put(p["id"], upstream_models)
-                    else:
-                        upstream_models = []
+                    upstream_models = await _fetch_models_from_upstream(p, key, timeout=10.0)
+                    _cache_put(p["id"], upstream_models)
 
                 for m in upstream_models:
                     mid = m.get("id", "")
@@ -130,14 +186,4 @@ async def proxy_models(provider_id: str = None):
 
 async def fetch_upstream_models(provider: dict, key: dict):
     """Fetch models from upstream /models endpoint."""
-    if provider_format(provider) == "anthropic-compatible":
-        return []
-
-    req = build_request(provider, "models", key["key_value"])
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(req["url"], headers=req["headers"])
-    if resp.status_code == 200:
-        data = resp.json()
-        return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
-    return []
+    return [m["id"] for m in await _fetch_models_from_upstream(provider, key, timeout=15.0)]
