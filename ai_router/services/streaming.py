@@ -417,6 +417,8 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             state = tool_state["calls"].get(key) or {}
             if state.get("emitted"):
                 continue
+            if not state.get("completed"):
+                continue
             state["emitted"] = True
             chunks.append(openai_stream_chunk({
                 "tool_calls": [{
@@ -430,6 +432,15 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 }]
             }))
         return chunks
+
+    def has_emitted_anthropic_tool_call():
+        return any((state or {}).get("emitted") for state in tool_state["calls"].values())
+
+    def has_incomplete_anthropic_tool_call():
+        return any(
+            not (state or {}).get("completed")
+            for state in tool_state["calls"].values()
+        )
 
     def normalize_anthropic_sse_line(line: str):
         stripped = line.strip()
@@ -454,16 +465,21 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             block = payload.get("content_block") or {}
             block_type = block.get("type")
             if block_type == "tool_use":
+                initial_input = block.get("input")
+                initial_arguments = ""
+                if initial_input not in (None, {}):
+                    initial_arguments = json.dumps(initial_input, ensure_ascii=False)
                 content_state["tools"] = True
                 content_state["text_buffer"] = ""
                 tool_state["calls"][index] = {
                     "index": index,
                     "id": block.get("id") or f"call_{index}",
                     "name": block.get("name") or "tool",
-                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    "arguments": initial_arguments,
+                    "completed": False,
                     "emitted": False,
                 }
-                output_state["chars"] += len(tool_state["calls"][index]["arguments"])
+                output_state["chars"] += len(initial_arguments)
                 return None, False
             if block_type == "text" and block.get("text"):
                 return buffer_or_emit_text(block["text"]), False
@@ -487,9 +503,11 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                     "id": f"call_{index}",
                     "name": "tool",
                     "arguments": "",
+                    "completed": False,
                     "emitted": False,
                 })
                 state["arguments"] = (state.get("arguments") or "") + delta["partial_json"]
+                state["completed"] = False
                 output_state["chars"] += len(delta["partial_json"])
                 return None, False
             if delta_type == "thinking_delta" and delta.get("thinking"):
@@ -498,6 +516,8 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             return None, False
         if event_type == "content_block_stop":
             index = payload.get("index", 0)
+            if index in tool_state["calls"]:
+                tool_state["calls"][index]["completed"] = True
             chunks = pop_anthropic_tool_chunks(index)
             if chunks:
                 return b"".join(chunks), False
@@ -517,7 +537,14 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 if content_state["tools"] or tool_state["calls"]:
                     content_state["text_buffer"] = ""
                     chunks.extend(pop_anthropic_tool_chunks())
-                    finish_reason = "tool_calls"
+                    if finish_reason != "length" and (chunks or has_emitted_anthropic_tool_call()):
+                        finish_reason = "tool_calls"
+                    elif has_incomplete_anthropic_tool_call():
+                        logger.warning(
+                            "Anthropic stream ended before tool arguments completed; finish_reason=%s",
+                            finish_reason,
+                        )
+                        finish_reason = "length"
                 else:
                     flushed = flush_buffered_text_if_no_tools()
                     if flushed:
