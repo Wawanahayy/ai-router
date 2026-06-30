@@ -165,7 +165,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('strategy', 'round-robin');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('require_login', 'false');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('login_password', 'ABC12345');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('require_api_key', 'true');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('rtk_enabled', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('rtk_enabled', 'true');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('rr_counter', '0');
 """
 
@@ -254,6 +254,14 @@ async def get_db() -> aiosqlite.Connection:
             await _db.execute(
                 "UPDATE settings SET value=? WHERE key='login_password' AND (value IS NULL OR value='')",
                 (config.AUTH_PASSWORD,),
+            )
+        cursor = await _db.execute("SELECT value FROM settings WHERE key='_rtk_default_true_migrated'")
+        if not await cursor.fetchone():
+            await _db.execute(
+                "UPDATE settings SET value='true' WHERE key='rtk_enabled' AND value='false'"
+            )
+            await _db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('_rtk_default_true_migrated', 'true')"
             )
         await cleanup_context_limit_state(_db)
         await _db.commit()
@@ -402,11 +410,16 @@ async def update_provider(provider_id: str, data: dict):
 
 async def delete_provider(provider_id: str):
     db = await get_db()
+    cursor = await db.execute("SELECT 1 FROM providers WHERE id=?", (provider_id,))
+    exists = bool(await cursor.fetchone())
+    if not exists:
+        return False
     await db.execute("DELETE FROM model_aliases WHERE provider_id=?", (provider_id,))
     await db.execute("DELETE FROM api_keys WHERE provider_id=?", (provider_id,))
     await db.execute("DELETE FROM combo_models WHERE provider_id=?", (provider_id,))
     await db.execute("DELETE FROM providers WHERE id=?", (provider_id,))
     await db.commit()
+    return True
 
 
 # --- API Key CRUD ---
@@ -496,10 +509,17 @@ async def update_key(key_id: str, data: dict):
             sets.append(f"{field}=?")
             vals.append(data[field])
     if not sets:
-        return
+        cursor = await db.execute("SELECT * FROM api_keys WHERE id=?", (key_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
     vals.append(key_id)
-    await db.execute(f"UPDATE api_keys SET {','.join(sets)} WHERE id=?", vals)
+    cursor = await db.execute(f"UPDATE api_keys SET {','.join(sets)} WHERE id=?", vals)
     await db.commit()
+    if cursor.rowcount < 1:
+        return None
+    cursor = await db.execute("SELECT * FROM api_keys WHERE id=?", (key_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
 
 
 async def delete_key(key_id: str):
@@ -911,6 +931,12 @@ async def clear_key_model_lock(key_id: str, model: str):
     await db.commit()
 
 
+async def clear_key_model_locks(key_id: str):
+    db = await get_db()
+    await db.execute("DELETE FROM key_model_locks WHERE key_id=?", (key_id,))
+    await db.commit()
+
+
 async def get_key_locks(provider_id: str = None):
     """Return all active key_model_locks for UI display."""
     db = await get_db()
@@ -996,8 +1022,9 @@ async def create_local_key(name: str = "", key_value: str = None):
 
 async def delete_local_key(key_id: str):
     db = await get_db()
-    await db.execute("DELETE FROM local_api_keys WHERE id=?", (key_id,))
+    cursor = await db.execute("DELETE FROM local_api_keys WHERE id=?", (key_id,))
     await db.commit()
+    return cursor.rowcount > 0
 
 
 async def toggle_local_key(key_id: str, is_active: int):
@@ -1015,10 +1042,17 @@ async def update_local_key(key_id: str, data: dict):
             sets.append(f"{field}=?")
             vals.append(data[field])
     if not sets:
-        return
+        cursor = await db.execute("SELECT * FROM local_api_keys WHERE id=?", (key_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
     vals.append(key_id)
-    await db.execute(f"UPDATE local_api_keys SET {','.join(sets)} WHERE id=?", vals)
+    cursor = await db.execute(f"UPDATE local_api_keys SET {','.join(sets)} WHERE id=?", vals)
     await db.commit()
+    if cursor.rowcount < 1:
+        return None
+    cursor = await db.execute("SELECT * FROM local_api_keys WHERE id=?", (key_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
 
 
 async def mark_local_key_used(key_id: str, tokens: int = 0):
@@ -1050,8 +1084,9 @@ async def add_alias(alias: str, provider_id: str, model_id: str, is_active: int 
 
 async def delete_alias(alias: str):
     db = await get_db()
-    await db.execute("DELETE FROM model_aliases WHERE alias=?", (alias,))
+    cursor = await db.execute("DELETE FROM model_aliases WHERE alias=?", (alias,))
     await db.commit()
+    return cursor.rowcount > 0
 
 
 async def delete_aliases_for_provider(provider_id: str):
@@ -1167,13 +1202,24 @@ async def update_combo(combo_id: str, data: dict):
 
 async def delete_combo(combo_id: str):
     db = await get_db()
+    cursor = await db.execute("SELECT 1 FROM combos WHERE id=?", (combo_id,))
+    exists = bool(await cursor.fetchone())
+    if not exists:
+        return False
     await db.execute("DELETE FROM combo_models WHERE combo_id=?", (combo_id,))
     await db.execute("DELETE FROM combos WHERE id=?", (combo_id,))
     await db.commit()
+    return True
 
 
 async def add_combo_model(combo_id: str, provider_id: str, model_id: str, alias: str = "", sort_order: int = 0):
     db = await get_db()
+    cursor = await db.execute("SELECT 1 FROM combos WHERE id=?", (combo_id,))
+    if not await cursor.fetchone():
+        raise ValueError("Combo not found")
+    cursor = await db.execute("SELECT 1 FROM providers WHERE id=?", (provider_id,))
+    if not await cursor.fetchone():
+        raise ValueError("Provider not found")
     mid = str(uuid.uuid4())
     await db.execute(
         "INSERT INTO combo_models (id, combo_id, provider_id, model_id, alias, is_active, sort_order) VALUES (?,?,?,?,?,?,?)",
@@ -1183,13 +1229,14 @@ async def add_combo_model(combo_id: str, provider_id: str, model_id: str, alias:
     return mid
 
 
-async def remove_combo_model(model_id: str):
+async def remove_combo_model(combo_id: str, model_id: str):
     db = await get_db()
-    await db.execute("DELETE FROM combo_models WHERE id=?", (model_id,))
+    cursor = await db.execute("DELETE FROM combo_models WHERE id=? AND combo_id=?", (model_id, combo_id))
     await db.commit()
+    return cursor.rowcount > 0
 
 
-async def update_combo_model(model_id: str, data: dict):
+async def update_combo_model(combo_id: str, model_id: str, data: dict):
     db = await get_db()
     sets = []
     vals = []
@@ -1198,10 +1245,17 @@ async def update_combo_model(model_id: str, data: dict):
             sets.append(f"{field}=?")
             vals.append(data[field])
     if not sets:
-        return
-    vals.append(model_id)
-    await db.execute(f"UPDATE combo_models SET {','.join(sets)} WHERE id=?", vals)
+        cursor = await db.execute("SELECT * FROM combo_models WHERE id=? AND combo_id=?", (model_id, combo_id))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    vals.extend([model_id, combo_id])
+    cursor = await db.execute(f"UPDATE combo_models SET {','.join(sets)} WHERE id=? AND combo_id=?", vals)
     await db.commit()
+    if cursor.rowcount < 1:
+        return None
+    cursor = await db.execute("SELECT * FROM combo_models WHERE id=? AND combo_id=?", (model_id, combo_id))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
 
 
 async def list_combo_models(combo_id: str):
@@ -1575,7 +1629,7 @@ async def set_setting(key: str, value: str):
 
 async def get_all_settings():
     db = await get_db()
-    cursor = await db.execute("SELECT key, value FROM settings WHERE key NOT LIKE '%_rr_%' AND key != 'rr_counter'")
+    cursor = await db.execute("SELECT key, value FROM settings WHERE key NOT LIKE '%_rr_%' AND key != 'rr_counter' AND key NOT LIKE '\\_%' ESCAPE '\\'")
     return {r["key"]: r["value"] for r in await cursor.fetchall()}
 
 

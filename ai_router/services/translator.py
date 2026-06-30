@@ -304,6 +304,7 @@ def response_tool_stats(data: dict):
         "tool_calls": 0,
         "finish_reason": "",
         "has_content": False,
+        "has_reasoning": False,
     }
     if not isinstance(data, dict):
         return stats
@@ -320,6 +321,8 @@ def response_tool_stats(data: dict):
                 continue
             if message.get("content"):
                 stats["has_content"] = True
+            if message.get("reasoning_content"):
+                stats["has_reasoning"] = True
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 stats["tool_calls"] += len(tool_calls)
@@ -332,6 +335,8 @@ def response_tool_stats(data: dict):
                 continue
             if part.get("type") == "text" and part.get("text"):
                 stats["has_content"] = True
+            if part.get("type") in ("thinking", "redacted_thinking"):
+                stats["has_reasoning"] = True
             if part.get("type") == "tool_use":
                 stats["tool_calls"] += 1
     return stats
@@ -638,5 +643,4 @@ def chat_response_to_history_messages(data: dict):
         if history_message.get("content") is not None or history_message.get("tool_calls"):
             messages.append(history_message)
     return messages
-
 

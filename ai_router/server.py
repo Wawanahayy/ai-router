@@ -304,7 +304,9 @@ async def api_update_provider(provider_id: str, request: Request):
 
 @app.delete("/api/providers/{provider_id}")
 async def api_delete_provider(provider_id: str):
-    await db.delete_provider(provider_id)
+    deleted = await db.delete_provider(provider_id)
+    if not deleted:
+        raise HTTPException(404, "Provider not found")
     proxy.invalidate_models_cache(provider_id)
     return {"ok": True}
 
@@ -423,6 +425,8 @@ async def api_add_keys_bulk(request: Request):
 @app.put("/api/keys/{key_id}")
 async def api_update_key(key_id: str, request: Request):
     data = await request.json()
+    replaced_key = "key" in data
+    allowed_fields = {"label", "status", "key_value", "cooldown_until", "last_error", "error_code", "last_used", "total_requests", "total_tokens"}
     if "key" in data:
         key_value = str(data.pop("key") or "").strip()
         if not key_value:
@@ -432,7 +436,13 @@ async def api_update_key(key_id: str, request: Request):
         data["cooldown_until"] = None
         data["error_code"] = None
         data["last_error"] = None
-    await db.update_key(key_id, data)
+    if not any(field in data for field in allowed_fields):
+        raise HTTPException(400, "No supported API key fields to update")
+    result = await db.update_key(key_id, data)
+    if not result:
+        raise HTTPException(404, "API key not found")
+    if replaced_key:
+        await db.clear_key_model_locks(key_id)
     proxy.invalidate_models_cache()
     return {"ok": True}
 
@@ -446,14 +456,19 @@ async def api_delete_key(key_id: str):
 
 @app.post("/api/keys/{key_id}/activate")
 async def api_activate_key(key_id: str):
-    await db.update_key(key_id, {"status": "alive", "cooldown_until": None, "error_code": None, "last_error": None})
+    result = await db.update_key(key_id, {"status": "alive", "cooldown_until": None, "error_code": None, "last_error": None})
+    if not result:
+        raise HTTPException(404, "API key not found")
+    await db.clear_key_model_locks(key_id)
     proxy.invalidate_models_cache()
     return {"ok": True}
 
 
 @app.post("/api/keys/{key_id}/deactivate")
 async def api_deactivate_key(key_id: str):
-    await db.update_key(key_id, {"status": "dead"})
+    result = await db.update_key(key_id, {"status": "dead"})
+    if not result:
+        raise HTTPException(404, "API key not found")
     proxy.invalidate_models_cache()
     return {"ok": True}
 
@@ -476,7 +491,9 @@ async def api_create_local_key(request: Request):
 
 @app.delete("/api/local-keys/{key_id}")
 async def api_delete_local_key(key_id: str):
-    await db.delete_local_key(key_id)
+    deleted = await db.delete_local_key(key_id)
+    if not deleted:
+        raise HTTPException(404, "Local key not found")
     return {"ok": True}
 
 
@@ -506,7 +523,9 @@ async def api_add_alias(request: Request):
 @app.post("/api/aliases/delete")
 async def api_delete_alias(request: Request):
     data = await request.json()
-    await db.delete_alias(data["alias"])
+    deleted = await db.delete_alias(data["alias"])
+    if not deleted:
+        raise HTTPException(404, "Alias not found")
     return {"ok": True}
 
 
@@ -581,6 +600,9 @@ async def api_set_settings(request: Request):
 @app.put("/api/local-keys/{key_id}")
 async def api_update_local_key(key_id: str, request: Request):
     data = await request.json()
+    allowed_fields = {"name", "key_value", "is_active", "rate_limit"}
+    if not any(field in data for field in allowed_fields):
+        raise HTTPException(400, "No supported local key fields to update")
     result = await db.update_local_key(key_id, data)
     if not result:
         raise HTTPException(404, "Local key not found")
@@ -624,7 +646,9 @@ async def api_update_combo(combo_id: str, request: Request):
 
 @app.delete("/api/combos/{combo_id}")
 async def api_delete_combo(combo_id: str):
-    await db.delete_combo(combo_id)
+    deleted = await db.delete_combo(combo_id)
+    if not deleted:
+        raise HTTPException(404, "Combo not found")
     return {"ok": True}
 
 
@@ -637,20 +661,38 @@ async def api_add_combo_model(combo_id: str, request: Request):
     sort_order = data.get("sort_order", 0)
     if not provider_id or not model_id:
         raise HTTPException(400, "Missing provider_id or model_id")
-    return await db.add_combo_model(combo_id, provider_id, model_id, alias, sort_order)
+    try:
+        return await db.add_combo_model(combo_id, provider_id, model_id, alias, sort_order)
+    except ValueError as e:
+        message = str(e)
+        if "not found" in message.lower():
+            raise HTTPException(404, message)
+        raise HTTPException(400, message)
 
 
 @app.delete("/api/combos/{combo_id}/models/{model_id}")
 async def api_remove_combo_model(combo_id: str, model_id: str):
-    await db.remove_combo_model(model_id)
+    deleted = await db.remove_combo_model(combo_id, model_id)
+    if not deleted:
+        raise HTTPException(404, "Combo model not found")
     return {"ok": True}
 
 
 @app.put("/api/combos/{combo_id}/models/{model_id}")
 async def api_update_combo_model(combo_id: str, model_id: str, request: Request):
     data = await request.json()
-    await db.update_combo_model(model_id, data)
-    return {"ok": True}
+    allowed_fields = {"provider_id", "model_id", "alias", "is_active", "sort_order"}
+    if not any(field in data for field in allowed_fields):
+        raise HTTPException(400, "No supported combo model fields to update")
+    try:
+        result = await db.update_combo_model(combo_id, model_id, data)
+    except Exception as e:
+        if "FOREIGN KEY constraint" in str(e):
+            raise HTTPException(404, "Provider not found")
+        raise
+    if not result:
+        raise HTTPException(404, "Combo model not found")
+    return result
 
 
 # ============ STATIC FILES (React frontend) ============

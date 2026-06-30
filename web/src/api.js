@@ -36,7 +36,13 @@ export const testProviderTools = (id, model) => apiFetch(`/api/providers/${id}/t
 })
 export const fetchModels = (id) => apiFetch(`/api/providers/${id}/fetch-models`, { method: 'POST' })
 
-export const getKeys = (providerId, status) => apiFetch(`/api/keys${providerId ? `?provider_id=${providerId}` : ''}${status ? `&status=${status}` : ''}`)
+export const getKeys = (providerId, status) => {
+  const params = new URLSearchParams()
+  if (providerId) params.set('provider_id', providerId)
+  if (status) params.set('status', status)
+  const query = params.toString()
+  return apiFetch(`/api/keys${query ? `?${query}` : ''}`)
+}
 export const addKey = (providerId, key, label = '') => apiFetch('/api/keys', { method: 'POST', body: JSON.stringify({ provider_id: providerId, key, label }) })
 export const addKeysBulk = (providerId, keys) => apiFetch('/api/keys/bulk', { method: 'POST', body: JSON.stringify({ provider_id: providerId, keys }) })
 export const deleteKey = (id) => apiFetch(`/api/keys/${id}`, { method: 'DELETE' })

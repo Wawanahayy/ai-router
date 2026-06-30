@@ -50,7 +50,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
     stream_state = {"model": model, "provider_type": provider_type}
     token_state = {"in": 0, "out": 0, "estimated": False}
     output_state = {"chars": 0}
-    content_state = {"content": False, "tools": False, "reasoning": "", "text_buffer": ""}
+    content_state = {"content": False, "tools": False, "text_buffer": ""}
     tool_state = {"calls": {}}
     openai_tool_state = {"calls": {}}
     openai_text_state = {"hold": False, "buffer": ""}
@@ -312,7 +312,6 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             text_chunks = []
             tool_chunks = []
             saw_tool = False
-            reasoning_parts = []
             for idx, part in enumerate(payload.get("content") or []):
                 if not isinstance(part, dict):
                     continue
@@ -334,19 +333,13 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                         }]
                     }))
                 elif part.get("type") in ("thinking", "redacted_thinking"):
-                    reasoning = part.get("thinking") or part.get("data") or part.get("text") or ""
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
+                    continue
             if saw_tool:
                 for chunk in tool_chunks:
                     yield chunk
             else:
                 for chunk in text_chunks:
                     yield chunk
-            if not text_chunks and not saw_tool and reasoning_parts:
-                reasoning_content = "".join(reasoning_parts)
-                output_state["chars"] += len(reasoning_content)
-                yield openai_stream_chunk({"content": reasoning_content})
             finish_reason = {
                 "stop_sequence": "stop",
                 "tool_use": "tool_calls",
@@ -390,6 +383,10 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             }],
         }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+    def track_reasoning_text(text: str):
+        if text:
+            output_state["chars"] += len(text)
 
     def buffer_or_emit_text(text: str):
         if not text:
@@ -472,8 +469,8 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 return buffer_or_emit_text(block["text"]), False
             if block_type in ("thinking", "redacted_thinking"):
                 thought = block.get("thinking") or block.get("text") or block.get("data") or ""
-                if isinstance(thought, str) and thought:
-                    content_state["reasoning"] += thought
+                if isinstance(thought, str):
+                    track_reasoning_text(thought)
                 return None, False
             return None, False
         if event_type == "content_block_delta":
@@ -496,7 +493,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 output_state["chars"] += len(delta["partial_json"])
                 return None, False
             if delta_type == "thinking_delta" and delta.get("thinking"):
-                content_state["reasoning"] += delta["thinking"]
+                track_reasoning_text(delta["thinking"])
                 return None, False
             return None, False
         if event_type == "content_block_stop":
@@ -525,10 +522,6 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                     flushed = flush_buffered_text_if_no_tools()
                     if flushed:
                         chunks.append(flushed)
-                    if not content_state["content"] and content_state["reasoning"]:
-                        output_state["chars"] += len(content_state["reasoning"])
-                        content_state["content"] = True
-                        chunks.append(openai_stream_chunk({"content": content_state["reasoning"]}))
                 chunks.append(openai_stream_chunk({}, finish_reason))
                 return b"".join(chunks), False
             return None, False
@@ -582,7 +575,6 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 output_state["chars"] = 0
                 content_state["content"] = False
                 content_state["tools"] = False
-                content_state["reasoning"] = ""
                 content_state["text_buffer"] = ""
                 tool_state["calls"] = {}
                 openai_tool_state["calls"] = {}

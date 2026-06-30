@@ -14,7 +14,7 @@ export default function Keys() {
   const [showBulk, setShowBulk] = useState(false)
   const [filterStatus, setFilterStatus] = useState('')
   const [pendingDelete, setPendingDelete] = useState(null)
-  const [now, setNow] = useState(Date.now())
+  const [now, setNow] = useState(() => Date.now())
 
   // Auto-refresh countdown every second
   useEffect(() => {

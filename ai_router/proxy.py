@@ -24,6 +24,11 @@ UPSTREAM_POOL_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_POOL_TIMEOUT", "20")
 STRICT_CONTEXT_FILTER = os.getenv("AI_ROUTER_STRICT_CONTEXT_FILTER", "false").lower() in ("1", "true", "yes", "on")
 RESPONSES_SESSION_TTL = float(os.getenv("AI_ROUTER_RESPONSES_SESSION_TTL", "3600"))
 RESPONSES_SESSION_MAX_MESSAGES = int(os.getenv("AI_ROUTER_RESPONSES_SESSION_MAX_MESSAGES", "120"))
+TOOL_MIN_OUTPUT_TOKENS = int(os.getenv("AI_ROUTER_TOOL_MIN_OUTPUT_TOKENS", "32768"))
+DISABLE_ANTHROPIC_THINKING_FOR_TOOLS = os.getenv(
+    "AI_ROUTER_DISABLE_ANTHROPIC_THINKING_FOR_TOOLS",
+    "true",
+).lower() in ("1", "true", "yes", "on")
 _responses_sessions: dict[str, dict] = {}
 
 
@@ -152,6 +157,38 @@ def _requested_output_tokens(body: dict | None) -> int:
         except (TypeError, ValueError):
             return 0
     return 0
+
+
+def _coerce_positive_int(value) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _raise_tool_output_limit(body: dict | None, minimum: int = TOOL_MIN_OUTPUT_TOKENS):
+    """Keep tool-call JSON from being truncated by too-small client output limits."""
+    if not isinstance(body, dict) or minimum <= 0 or not translator.request_needs_tools(body):
+        return
+
+    present = [key for key in ("max_tokens", "max_completion_tokens") if key in body]
+    if not present:
+        body["max_tokens"] = minimum
+        return
+
+    for key in present:
+        current = _coerce_positive_int(body.get(key))
+        if current <= 0 or current < minimum:
+            body[key] = minimum
+
+
+def _disable_anthropic_thinking_for_tool_request(body: dict | None):
+    if (
+        DISABLE_ANTHROPIC_THINKING_FOR_TOOLS
+        and isinstance(body, dict)
+        and translator.request_needs_tools(body)
+    ):
+        body.pop("thinking", None)
 
 
 def _requested_context_tokens(body: dict | None) -> int:
@@ -697,7 +734,8 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
             tool_stats["missing_tool_call_id"],
             tool_stats["orphan_tool_results"],
         )
-    rtk_enabled = (await db.get_setting("rtk_enabled")) == "true"
+    rtk_setting = await db.get_setting("rtk_enabled")
+    rtk_enabled = str(rtk_setting).lower() != "false"
     request_body, rtk_stats = rtk.compress_request_body(request_body, enabled=rtk_enabled)
     if rtk_stats.changed:
         logger.info(
@@ -706,10 +744,11 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
             rtk_stats.saved_chars,
         )
 
-    # Sensible default for OpenAI-compatible path so reasoning-heavy models
-    # (Claude haiku/sonnet, GLM, MiniMax etc) don't truncate mid-tool-call.
-    # Anthropic-native path overrides this higher in _prepare_anthropic_native.
-    request_body.setdefault("max_tokens", 16384)
+    _raise_tool_output_limit(request_body)
+    if "max_tokens" not in request_body and "max_completion_tokens" not in request_body:
+        request_body["max_tokens"] = 16384
+    if provider_format(provider) == "anthropic-compatible":
+        _disable_anthropic_thinking_for_tool_request(request_body)
 
     prepared = build_request(provider, "chat", event_stream=bool(request_body.get("stream")))
     headers = prepared["headers"]
@@ -1019,6 +1058,38 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
                         continue
                     break
 
+                try:
+                    response_data = resp.json()
+                except Exception as e:
+                    error_msg = error_policy._sanitize_error(f"Invalid JSON response: {e}", status_code=502)
+                    await db.mark_key_error(key["id"], 502, error_msg, actual_model, provider.get("name", ""))
+                    fallback_chain.append(_chain_item(provider, key, actual_model, 502, error_msg, latency))
+                    await db.add_log(provider_id, key["id"], actual_model, 0, 0, latency, 502, error_msg, local_key_id, fallback_chain)
+                    last_error = error_msg
+                    last_status = 502
+                    continue
+                tokens_in, tokens_out = _extract_anthropic_tokens(resp)
+                tokens_in, tokens_out = _with_estimated_tokens(tokens_in, tokens_out, prepared["body"], response_data)
+                total_tokens = tokens_in + tokens_out
+                await db.mark_key_success(key["id"], tokens_in, tokens_out)
+                await db.clear_key_model_lock(key["id"], actual_model)
+                await db.mark_key_used(key["id"])
+                if local_key_id:
+                    await db.mark_local_key_used(local_key_id, total_tokens)
+                success_chain = fallback_chain if fallback_chain else None
+                await db.add_log(
+                    provider_id,
+                    key["id"],
+                    actual_model,
+                    tokens_in,
+                    tokens_out,
+                    latency,
+                    resp.status_code,
+                    local_key_id=local_key_id,
+                    fallback_chain=success_chain,
+                )
+                return response_data, resp.status_code
+
             wait_seconds = _transient_wait_seconds(last_status, last_error)
             if wait_seconds:
                 await asyncio.sleep(wait_seconds)
@@ -1184,7 +1255,17 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                         continue
                     break
 
-                response_data = _filter_anthropic_native_tool_text(resp.json())
+                try:
+                    response_data = _filter_anthropic_native_tool_text(resp.json())
+                except Exception as e:
+                    error_msg = error_policy._sanitize_error(f"Invalid JSON response: {e}", status_code=502)
+                    await db.mark_key_error(key["id"], 502, error_msg, actual_model, provider.get("name", ""))
+                    item = _chain_item(provider, key, actual_model, 502, error_msg, latency)
+                    fallback_chain.append(item)
+                    await db.add_log(provider_id, key["id"], actual_model, 0, 0, latency, 502, error_msg, local_key_id, fallback_chain)
+                    last_error = error_msg
+                    last_status = 502
+                    continue
                 tokens_in, tokens_out = _extract_tokens(resp)
                 tokens_in, tokens_out = _with_estimated_tokens(tokens_in, tokens_out, prepared["body"], response_data)
                 total_tokens = tokens_in + tokens_out
@@ -1219,6 +1300,8 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
 def _prepare_anthropic_native(provider: dict, body: dict, actual_model: str):
     body["model"] = actual_model
     translator.normalize_messages(body, provider, actual_model)
+    _raise_tool_output_limit(body)
+    _disable_anthropic_thinking_for_tool_request(body)
     body.setdefault("max_tokens", 40960)
     prepared = build_request(provider, "chat", event_stream=bool(body.get("stream")))
     return {
