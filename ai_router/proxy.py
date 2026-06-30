@@ -29,6 +29,7 @@ DISABLE_ANTHROPIC_THINKING_FOR_TOOLS = os.getenv(
     "AI_ROUTER_DISABLE_ANTHROPIC_THINKING_FOR_TOOLS",
     "true",
 ).lower() in ("1", "true", "yes", "on")
+DEBUG_REQUEST_SHAPE = os.getenv("AI_ROUTER_DEBUG_REQUEST_SHAPE", "false").lower() in ("1", "true", "yes", "on")
 _responses_sessions: dict[str, dict] = {}
 
 
@@ -189,6 +190,194 @@ def _disable_anthropic_thinking_for_tool_request(body: dict | None):
         and translator.request_needs_tools(body)
     ):
         body.pop("thinking", None)
+
+
+def _text_len(value) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            if isinstance(item, str):
+                total += len(item)
+            elif isinstance(item, dict):
+                total += _text_len(item.get("text"))
+                total += _text_len(item.get("content"))
+                total += _text_len(item.get("input"))
+            elif item is not None:
+                total += len(str(item))
+        return total
+    if isinstance(value, dict):
+        total = 0
+        for key in ("text", "content", "input", "arguments"):
+            total += _text_len(value.get(key))
+        return total
+    return 0
+
+
+def _message_shapes(body: dict | None):
+    if not isinstance(body, dict):
+        return []
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return []
+    shapes = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            shapes.append({"i": index, "type": type(message).__name__})
+            continue
+        content = message.get("content")
+        part_types = []
+        if isinstance(content, list):
+            part_types = [
+                part.get("type", type(part).__name__) if isinstance(part, dict) else type(part).__name__
+                for part in content[:12]
+            ]
+        shapes.append({
+            "i": index,
+            "role": message.get("role"),
+            "content_type": type(content).__name__,
+            "content_chars": _text_len(content),
+            "parts": part_types,
+            "tool_calls": len(message.get("tool_calls") or []) if isinstance(message.get("tool_calls"), list) else 0,
+            "tool_call_id": bool(message.get("tool_call_id")),
+        })
+    return shapes
+
+
+def _tool_names(body: dict | None):
+    if not isinstance(body, dict):
+        return []
+    names = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name") if isinstance(function, dict) else None
+        if name:
+            names.append(name)
+    return names[:20]
+
+
+def _nested_debug_flags(body: dict | None):
+    if not isinstance(body, dict):
+        return {}
+    extra_body = body.get("extra_body") if isinstance(body.get("extra_body"), dict) else {}
+    model_kwargs = body.get("model_kwargs") if isinstance(body.get("model_kwargs"), dict) else {}
+    return {
+        "has_thinking": "thinking" in body,
+        "has_reasoning": "reasoning" in body,
+        "has_reasoning_effort": "reasoning_effort" in body,
+        "extra_body_keys": sorted(extra_body.keys()),
+        "model_kwargs_keys": sorted(model_kwargs.keys()),
+        "extra_body_has_thinking": "thinking" in extra_body,
+        "extra_body_has_reasoning": "reasoning" in extra_body,
+        "model_kwargs_has_thinking": "thinking" in model_kwargs,
+        "model_kwargs_has_reasoning": "reasoning" in model_kwargs,
+    }
+
+
+def _log_request_shape(stage: str, provider: dict | None, body: dict | None, actual_model: str = "", rtk_stats=None):
+    if not DEBUG_REQUEST_SHAPE or not isinstance(body, dict):
+        return
+    payload = {
+        "stage": stage,
+        "provider": (provider or {}).get("name"),
+        "provider_id": (provider or {}).get("id"),
+        "format": provider_format(provider or {}) if provider else "",
+        "model": actual_model or body.get("model"),
+        "stream": bool(body.get("stream")),
+        "needs_tools": translator.request_needs_tools(body),
+        "tools": len(body.get("tools") or []),
+        "tool_names": _tool_names(body),
+        "tool_choice": body.get("tool_choice"),
+        "max_tokens": body.get("max_tokens"),
+        "max_completion_tokens": body.get("max_completion_tokens"),
+        "max_output_tokens": body.get("max_output_tokens"),
+        "estimated_input_tokens": _estimate_input_tokens(body),
+        "messages": _message_shapes(body),
+        **_nested_debug_flags(body),
+    }
+    if rtk_stats is not None:
+        payload["rtk"] = {
+            "changed": bool(rtk_stats.changed),
+            "seen": rtk_stats.messages_seen,
+            "compressed": rtk_stats.messages_compressed,
+            "chars_before": rtk_stats.chars_before,
+            "chars_after": rtk_stats.chars_after,
+            "saved_chars": rtk_stats.saved_chars,
+        }
+    logger.warning("AI_ROUTER_REQUEST_SHAPE %s", json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _response_shape(data):
+    if not isinstance(data, dict):
+        return {"type": type(data).__name__}
+
+    shape = {
+        "type": data.get("type"),
+        "object": data.get("object"),
+        "model": data.get("model"),
+        "stop_reason": data.get("stop_reason"),
+        "stop_sequence": data.get("stop_sequence"),
+        "usage": data.get("usage") or data.get("usageMetadata"),
+    }
+
+    if isinstance(data.get("content"), list):
+        blocks = []
+        for index, part in enumerate(data.get("content") or []):
+            if not isinstance(part, dict):
+                blocks.append({"i": index, "type": type(part).__name__})
+                continue
+            part_type = part.get("type")
+            blocks.append({
+                "i": index,
+                "type": part_type,
+                "text_chars": _text_len(part.get("text") or part.get("thinking") or part.get("data")),
+                "input_chars": _text_len(part.get("input")),
+                "name": part.get("name") if part_type == "tool_use" else None,
+            })
+        shape["content_blocks"] = blocks
+
+    if isinstance(data.get("choices"), list):
+        choices = []
+        for index, choice in enumerate(data.get("choices") or []):
+            if not isinstance(choice, dict):
+                choices.append({"i": index, "type": type(choice).__name__})
+                continue
+            message = choice.get("message") or choice.get("delta") or {}
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            choices.append({
+                "i": index,
+                "finish_reason": choice.get("finish_reason"),
+                "message_keys": sorted(message.keys()) if isinstance(message, dict) else [],
+                "content_chars": _text_len(message.get("content")) if isinstance(message, dict) else 0,
+                "reasoning_chars": _text_len(message.get("reasoning_content")) if isinstance(message, dict) else 0,
+                "tool_calls": len(tool_calls or []) if isinstance(tool_calls, list) else 0,
+                "tool_arg_chars": [
+                    _text_len(((tool_call or {}).get("function") or {}).get("arguments"))
+                    for tool_call in (tool_calls or [])[:10]
+                    if isinstance(tool_call, dict)
+                ] if isinstance(tool_calls, list) else [],
+            })
+        shape["choices"] = choices
+
+    return shape
+
+
+def _log_response_shape(stage: str, provider: dict | None, data, actual_model: str = "", status_code: int | None = None):
+    if not DEBUG_REQUEST_SHAPE:
+        return
+    payload = {
+        "stage": stage,
+        "provider": (provider or {}).get("name"),
+        "provider_id": (provider or {}).get("id"),
+        "format": provider_format(provider or {}) if provider else "",
+        "model": actual_model,
+        "status_code": status_code,
+        "response": _response_shape(data),
+    }
+    logger.warning("AI_ROUTER_RESPONSE_SHAPE %s", json.dumps(payload, ensure_ascii=False, default=str))
 
 
 def _requested_context_tokens(body: dict | None) -> int:
@@ -723,6 +912,7 @@ def _provider_unsupported_reason(provider: dict, request_body: dict):
 async def _prepare_upstream(provider: dict, request_body: dict, actual_model: str):
     request_body["model"] = actual_model
     tool_stats = translator.normalize_messages(request_body, provider, actual_model)
+    _log_request_shape("pre_rtk", provider, request_body, actual_model)
     if tool_stats["tools_declared"] or tool_stats["assistant_tool_calls"] or tool_stats["tool_results"]:
         logger.info(
             "Tool flow provider=%s model=%s tools=%s assistant_calls=%s tool_results=%s missing_ids=%s orphan_results=%s",
@@ -737,6 +927,7 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
     rtk_setting = await db.get_setting("rtk_enabled")
     rtk_enabled = str(rtk_setting).lower() != "false"
     request_body, rtk_stats = rtk.compress_request_body(request_body, enabled=rtk_enabled)
+    _log_request_shape("post_rtk", provider, request_body, actual_model, rtk_stats)
     if rtk_stats.changed:
         logger.info(
             "RTK compressed %s tool message(s), saved %s chars",
@@ -756,12 +947,14 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
 
     if provider_format(provider) == "anthropic-compatible":
         request_body = translator.openai_to_anthropic(request_body)
+        _log_request_shape("post_anthropic_translate", provider, request_body, actual_model)
     elif request_body.get("stream"):
         stream_options = request_body.get("stream_options")
         if not isinstance(stream_options, dict):
             stream_options = {}
         stream_options.setdefault("include_usage", True)
         request_body["stream_options"] = stream_options
+    _log_request_shape("prepared_upstream", provider, request_body, actual_model)
 
     return {"url": url, "headers": headers, "body": request_body}
 
@@ -1060,6 +1253,7 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
 
                 try:
                     response_data = resp.json()
+                    _log_response_shape("anthropic_native_upstream", provider, response_data, actual_model, resp.status_code)
                 except Exception as e:
                     error_msg = error_policy._sanitize_error(f"Invalid JSON response: {e}", status_code=502)
                     await db.mark_key_error(key["id"], 502, error_msg, actual_model, provider.get("name", ""))
@@ -1256,7 +1450,11 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                     break
 
                 try:
-                    response_data = _filter_anthropic_native_tool_text(resp.json())
+                    raw_response_data = resp.json()
+                    _log_response_shape("chat_upstream_raw", provider, raw_response_data, actual_model, resp.status_code)
+                    response_data = _filter_anthropic_native_tool_text(raw_response_data)
+                    if response_data is not raw_response_data:
+                        _log_response_shape("chat_upstream_filtered", provider, response_data, actual_model, resp.status_code)
                 except Exception as e:
                     error_msg = error_policy._sanitize_error(f"Invalid JSON response: {e}", status_code=502)
                     await db.mark_key_error(key["id"], 502, error_msg, actual_model, provider.get("name", ""))
@@ -1277,6 +1475,7 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                 success_chain = fallback_chain if fallback_chain else None
                 await db.add_log(provider_id, key["id"], actual_model, tokens_in, tokens_out, latency, resp.status_code, local_key_id=local_key_id, fallback_chain=success_chain)
                 client_response = translator.normalize_chat_response(response_data, provider, actual_model, request_body)
+                _log_response_shape("client_response", provider, client_response, actual_model, resp.status_code)
                 response_tool_stats = translator.response_tool_stats(client_response)
                 if request_body.get("tools") or request_body.get("tool_choice") or response_tool_stats["tool_calls"]:
                     logger.info(
@@ -1300,9 +1499,11 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
 def _prepare_anthropic_native(provider: dict, body: dict, actual_model: str):
     body["model"] = actual_model
     translator.normalize_messages(body, provider, actual_model)
+    _log_request_shape("anthropic_native_pre_prepare", provider, body, actual_model)
     _raise_tool_output_limit(body)
     _disable_anthropic_thinking_for_tool_request(body)
     body.setdefault("max_tokens", 40960)
+    _log_request_shape("anthropic_native_pre_send", provider, body, actual_model)
     prepared = build_request(provider, "chat", event_stream=bool(body.get("stream")))
     return {
         "url": prepared["url"],
