@@ -36,13 +36,16 @@ def parse_extra_headers(provider: dict) -> dict:
     if not raw:
         return {}
     if isinstance(raw, dict):
-        return raw
-    try:
-        value = json.loads(raw)
-        return value if isinstance(value, dict) else {}
-    except Exception as e:
-        logger.warning("Invalid extra_headers for provider %s: %s", provider.get("id"), e)
-        return {}
+        result = raw
+    else:
+        try:
+            value = json.loads(raw)
+            result = value if isinstance(value, dict) else {}
+        except Exception as e:
+            logger.warning("Invalid extra_headers for provider %s: %s", provider.get("id"), e)
+            return {}
+    # Convert all values to strings (HTTP headers must be str/bytes)
+    return {k: str(v) for k, v in result.items()}
 
 
 def _add_query_param(url: str, name: str, value: str) -> str:

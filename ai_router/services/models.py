@@ -99,24 +99,65 @@ def normalize_models_payload(data) -> list[dict]:
 
 
 async def _fetch_models_from_upstream(provider: dict, key: dict, timeout: float = 15.0) -> list[dict]:
-    req = build_request(provider, "models", key["key_value"])
+    requests = [("configured", build_request(provider, "models", key["key_value"]))]
+
+    # Anthropic-native chat uses x-api-key, but many Anthropic-compatible
+    # gateways expose an OpenAI-style /models endpoint that only accepts
+    # Authorization: Bearer. Preserve the configured request first, then retry
+    # discovery with Bearer auth without changing the provider's chat path.
+    fmt = provider_format(provider)
+    auth_type = (provider.get("auth_type") or "").strip().lower()
+    if fmt == "anthropic-compatible" and auth_type in ("", "x-api-key"):
+        bearer_provider = dict(provider)
+        bearer_provider.update({
+            "auth_type": "bearer",
+            "auth_header": "Authorization",
+            "auth_prefix": "Bearer ",
+        })
+        requests.append(("bearer-fallback", build_request(bearer_provider, "models", key["key_value"])))
+
+    last_response = None
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(req["url"], headers=req["headers"])
-    if resp.status_code != 200:
-        logger.warning(
-            "Failed to fetch upstream models provider=%s format=%s status=%s body=%s",
-            provider.get("id"),
-            provider_format(provider),
-            resp.status_code,
-            resp.text[:300],
-        )
-        return []
-    try:
-        data = resp.json()
-    except Exception:
-        logger.warning("Invalid upstream models JSON provider=%s body=%s", provider.get("id"), resp.text[:300])
-        return []
-    return normalize_models_payload(data)
+        for auth_mode, req in requests:
+            try:
+                resp = await client.get(req["url"], headers=req["headers"])
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Failed to fetch upstream models provider=%s format=%s auth_mode=%s error=%s",
+                    provider.get("id"),
+                    fmt,
+                    auth_mode,
+                    exc.__class__.__name__,
+                )
+                continue
+            last_response = resp
+            if resp.status_code != 200:
+                logger.warning(
+                    "Failed to fetch upstream models provider=%s format=%s auth_mode=%s status=%s body=%s",
+                    provider.get("id"),
+                    fmt,
+                    auth_mode,
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning(
+                    "Invalid upstream models JSON provider=%s auth_mode=%s body=%s",
+                    provider.get("id"),
+                    auth_mode,
+                    resp.text[:300],
+                )
+                continue
+            models = normalize_models_payload(data)
+            if models or auth_mode == requests[-1][0]:
+                return models
+
+    if last_response is None:
+        logger.warning("No upstream model discovery request built for provider=%s", provider.get("id"))
+    return []
 
 
 async def proxy_models(provider_id: str = None):

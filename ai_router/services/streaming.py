@@ -88,6 +88,24 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         if token_state["in"] or token_state["out"]:
             token_state["estimated"] = False
 
+    def has_semantic_output() -> bool:
+        """Return true only when the upstream produced usable assistant output."""
+        if content_state.get("tools"):
+            return True
+        if content_state.get("text_buffer", "").strip():
+            return True
+        if content_state.get("reasoning_buffer", "").strip():
+            return True
+        return False
+
+    def request_has_tool_results(request_body: dict | None) -> bool:
+        """Return true when this request continues an earlier tool execution."""
+        messages = (request_body or {}).get("messages")
+        return isinstance(messages, list) and any(
+            isinstance(message, dict) and message.get("role") == "tool"
+            for message in messages
+        )
+
     def request_has_tools(request_body: dict | None) -> bool:
         return isinstance(request_body, dict) and any(
             key in request_body
@@ -101,6 +119,13 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
             value = delta.get(key)
             if isinstance(value, str):
                 output_state["chars"] += len(value)
+                content_state["text_buffer"] += value
+        # Track reasoning_content separately
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str):
+            if "reasoning_buffer" not in content_state:
+                content_state["reasoning_buffer"] = ""
+            content_state["reasoning_buffer"] += reasoning
         for tool_call in delta.get("tool_calls") or []:
             if not isinstance(tool_call, dict):
                 continue
@@ -187,6 +212,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         return bool(
             delta.get("role")
             or delta.get("content")
+            or delta.get("reasoning_content")
             or delta.get("tool_calls")
             or choice.get("finish_reason")
         )
@@ -603,11 +629,14 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                 content_state["content"] = False
                 content_state["tools"] = False
                 content_state["text_buffer"] = ""
+                content_state["reasoning_buffer"] = ""
                 tool_state["calls"] = {}
                 openai_tool_state["calls"] = {}
                 openai_text_state["hold"] = request_has_tools(attempt.get("body"))
                 openai_text_state["buffer"] = ""
                 current_start = time.time()
+                defer_output = request_has_tool_results(attempt.get("body"))
+                deferred_outputs = []
 
                 async def record_stream_opened():
                     nonlocal opened_success
@@ -624,6 +653,15 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                         return
                     finalized_success = True
                     await record_stream_opened()
+                    
+                    # Store reasoning_content for thinking models
+                    from .. import reasoning_middleware
+                    if reasoning_middleware.is_thinking_model(attempt.get("model", "")):
+                        final_content = content_state.get("text_buffer", "")
+                        final_reasoning = content_state.get("reasoning_buffer", "")
+                        if final_content and final_reasoning:
+                            reasoning_middleware.store_reasoning(final_content, final_reasoning)
+                    
                     tokens_in = token_state["in"]
                     tokens_out = token_state["out"]
                     if not tokens_in and not tokens_out:
@@ -665,13 +703,27 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                             latency = int((time.time() - current_start) * 1000)
                             await db.add_log(attempt["provider_id"], attempt["key_id"], attempt["model"], 0, 0, latency, resp.status_code, error_msg, attempt.get("local_key_id"))
                             last_error = error_msg[:200]
+                            # Retry fallback if more attempts available. Retry ALL remaining attempts:
+                            # - different keys in same provider (exhaust all keys first), OR
+                            # - different provider/group (cross-provider fallback)
                             if index < len(attempts) - 1:
                                 next_group = attempts[index + 1].get("group")
-                                if resp.status_code == 429 and next_group != attempt.get("group"):
-                                    await asyncio.sleep(_rate_limit_wait_seconds(index + 1))
-                                elif next_group != attempt.get("group") and resp.status_code in (502, 503, 504, 524) and STREAM_TRANSIENT_WAIT > 0:
-                                    await asyncio.sleep(STREAM_TRANSIENT_WAIT)
-                                continue
+                                same_provider = attempts[index + 1].get("provider_id") == attempt.get("provider_id")
+                                
+                                # Special handling for rate limit (429) - always wait longer
+                                if resp.status_code == 429:
+                                    if same_provider or next_group != attempt.get("group"):
+                                        await asyncio.sleep(_rate_limit_wait_seconds(index + 1))
+                                        continue
+                                # Transient errors (5xx) - retry with delay
+                                elif resp.status_code in (502, 503, 504, 524):
+                                    if same_provider or next_group != attempt.get("group"):
+                                        if STREAM_TRANSIENT_WAIT > 0:
+                                            await asyncio.sleep(STREAM_TRANSIENT_WAIT)
+                                        continue
+                                # Other errors - retry immediately if same provider or different group
+                                elif same_provider or next_group != attempt.get("group"):
+                                    continue
                             yield error_chunk(last_error)
                             return
 
@@ -720,15 +772,17 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                                     output, is_done = normalize_sse_line(line)
                                 if is_done:
                                     sent_done = True
-                                    await finalize_stream_success()
-                                if output:
-                                    await record_stream_opened()
-                                    emitted = True
-                                    yield output
+                                if output and not is_done:
+                                    if defer_output:
+                                        deferred_outputs.append(output)
+                                    else:
+                                        await record_stream_opened()
+                                        emitted = True
+                                        yield output
                                 if sent_done:
                                     break
                             if sent_done:
-                                return
+                                break
 
                         if buffer.strip():
                             if current_type != "anthropic-compatible" and _looks_like_anthropic_event(buffer):
@@ -740,17 +794,43 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                                 output, is_done = normalize_sse_line(buffer)
                             if is_done:
                                 sent_done = True
-                                await finalize_stream_success()
-                            if output:
-                                await record_stream_opened()
-                                emitted = True
-                                yield output
+                            if output and not is_done:
+                                if defer_output:
+                                    deferred_outputs.append(output)
+                                else:
+                                    await record_stream_opened()
+                                    emitted = True
+                                    yield output
 
+                        # Do not classify an HTTP 200 stream with no semantic output
+                        # as success. Keep tool-result continuations buffered so a
+                        # retry can happen before any bytes reach Hermes.
+                        if defer_output and not has_semantic_output():
+                            last_error = "upstream returned an empty response after tool results"
+                            await db.mark_key_error(attempt["key_id"], 502, last_error, attempt["model"])
+                            latency = int((time.time() - current_start) * 1000)
+                            await db.add_log(
+                                attempt["provider_id"], attempt["key_id"], attempt["model"],
+                                0, 0, latency, 502, last_error, attempt.get("local_key_id"),
+                            )
+                            logger.warning(
+                                "Empty tool continuation provider=%s model=%s received_raw=%s outputs=%s",
+                                attempt.get("provider_name") or attempt.get("provider_id"),
+                                attempt["model"], received_raw, len(deferred_outputs),
+                            )
+                            if index < len(attempts) - 1:
+                                if STREAM_TRANSIENT_WAIT > 0:
+                                    await asyncio.sleep(STREAM_TRANSIENT_WAIT)
+                                continue
+                            yield error_chunk("upstream failed to produce an executable response after retries")
+                            return
+
+                        await finalize_stream_success()
+                        for deferred_output in deferred_outputs:
+                            emitted = True
+                            yield deferred_output
                         if not sent_done:
-                            await finalize_stream_success()
                             yield b"data: [DONE]\n\n"
-                        else:
-                            await finalize_stream_success()
                         return
                 except (httpx.TimeoutException, asyncio.TimeoutError) as e:
                     latency = int((time.time() - current_start) * 1000)
@@ -768,14 +848,18 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                         timeout_msg,
                     )
                     last_error = f"Upstream {timeout_msg.lower()}"
-                    # Only fall back if we haven't committed bytes to the
-                    # client yet (avoids corrupting the SSE response) AND the
-                    # next attempt is a different group (different provider —
-                    # same provider is likely having the same outage).
+                    # Retry fallback if we haven't committed bytes to the client yet
+                    # (avoids corrupting the SSE response). Retry ALL remaining attempts:
+                    # - different keys in same provider (exhaust all keys first), OR
+                    # - different provider/group (cross-provider fallback)
                     if not emitted and index < len(attempts) - 1:
                         next_group = attempts[index + 1].get("group")
-                        if next_group != attempt.get("group") and STREAM_TRANSIENT_WAIT > 0:
-                            await asyncio.sleep(STREAM_TRANSIENT_WAIT)
+                        same_provider = attempts[index + 1].get("provider_id") == attempt.get("provider_id")
+                        
+                        # Retry if next attempt is same provider (different key) OR different group
+                        if same_provider or next_group != attempt.get("group"):
+                            if STREAM_TRANSIENT_WAIT > 0:
+                                await asyncio.sleep(STREAM_TRANSIENT_WAIT)
                             continue
                     yield error_chunk(last_error)
                     return

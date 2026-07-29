@@ -277,6 +277,37 @@ def _nested_debug_flags(body: dict | None):
     }
 
 
+def _debug_anthropic_tool_ids(body: dict):
+    """Log tool_use IDs vs tool_result IDs to debug MISMATCH errors."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    tool_use_ids = {}  # id -> msg index
+    tool_result_ids = {}  # id -> msg index
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                tool_use_ids[block.get("id")] = idx
+            elif block.get("type") == "tool_result":
+                tool_result_ids[block.get("tool_use_id")] = idx
+    orphan_results = set(tool_result_ids.keys()) - set(tool_use_ids.keys())
+    orphan_uses = set(tool_use_ids.keys()) - set(tool_result_ids.keys())
+    if orphan_results:
+        detail = {rid: f"msg[{tool_result_ids[rid]}]" for rid in orphan_results}
+        logger.warning("ANTHROPIC_TOOL_ID_MISMATCH tool_result refers to non-existent tool_use: %s", detail)
+    if orphan_uses and len(orphan_uses) > 1:
+        # More than 1 orphan use is suspicious (1 is normal - the last turn)
+        detail = {uid: f"msg[{tool_use_ids[uid]}]" for uid in orphan_uses}
+        logger.warning("ANTHROPIC_TOOL_ID_INFO multiple pending tool_use without result: %s", detail)
+
+
 def _log_request_shape(stage: str, provider: dict | None, body: dict | None, actual_model: str = "", rtk_stats=None):
     if not DEBUG_REQUEST_SHAPE or not isinstance(body, dict):
         return
@@ -913,6 +944,10 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
     request_body["model"] = actual_model
     tool_stats = translator.normalize_messages(request_body, provider, actual_model)
     _log_request_shape("pre_rtk", provider, request_body, actual_model)
+    
+    # Auto-inject reasoning_content for thinking models (DeepSeek V4 Pro, etc)
+    from . import reasoning_middleware
+    reasoning_middleware.inject_reasoning_content(request_body, actual_model)
     if tool_stats["tools_declared"] or tool_stats["assistant_tool_calls"] or tool_stats["tool_results"]:
         logger.info(
             "Tool flow provider=%s model=%s tools=%s assistant_calls=%s tool_results=%s missing_ids=%s orphan_results=%s",
@@ -947,6 +982,8 @@ async def _prepare_upstream(provider: dict, request_body: dict, actual_model: st
 
     if provider_format(provider) == "anthropic-compatible":
         request_body = translator.openai_to_anthropic(request_body)
+        # DEBUG: log tool_use/tool_result ID pairs to diagnose MISMATCH errors
+        _debug_anthropic_tool_ids(request_body)
         _log_request_shape("post_anthropic_translate", provider, request_body, actual_model)
     elif request_body.get("stream"):
         stream_options = request_body.get("stream_options")

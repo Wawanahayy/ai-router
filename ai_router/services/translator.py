@@ -1,11 +1,31 @@
 import hashlib
 import json
 import logging
+import re
 import time
 
 from .upstream import provider_format
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_anthropic_tool_id(raw_id: str, msg_index: int = -1) -> str:
+    """Normalize a tool call ID to Anthropic/Bedrock-compatible format.
+
+    Anthropic requires tool_use IDs matching: ^toolu_[A-Za-z0-9]{1,64}$
+    IDs must be UNIQUE across the entire conversation. Since clients like
+    Hermes reuse IDs (e.g. "terminal:0" for every tool call), we incorporate
+    the message index to ensure uniqueness.
+    """
+    if not raw_id:
+        raw_id = "unknown"
+    # If already valid toolu_ format AND we don't need dedup (msg_index=-1), pass through
+    if msg_index == -1 and raw_id.startswith("toolu_") and re.match(r'^toolu_[A-Za-z0-9]+$', raw_id):
+        return raw_id
+    # Deterministic + unique: hash raw_id + msg_index together
+    seed = f"{raw_id}::{msg_index}" if msg_index >= 0 else raw_id
+    suffix = hashlib.md5(seed.encode()).hexdigest()[:24]
+    return f"toolu_{suffix}"
 
 
 def request_needs_tools(body: dict | None):
@@ -97,7 +117,38 @@ def openai_to_anthropic(body: dict):
     system_parts = []
     converted = []
 
-    for msg in messages:
+    # Pre-pass: for each tool result msg, find its matching assistant msg_index.
+    # When IDs are reused (e.g. "terminal:0" repeated), match each tool result
+    # to the nearest PRECEDING assistant message with that same tool_call id.
+    tool_result_to_assistant_idx = {}  # tool_result msg_index -> assistant msg_index
+    # Track assistant messages with their tool_call ids in order
+    pending_tool_calls = []  # list of (msg_index, set_of_tc_ids)
+    for msg_index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            tc_ids = set()
+            for tc in (msg.get("tool_calls") or []):
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    tc_ids.add(tc_id)
+            if tc_ids:
+                pending_tool_calls.append((msg_index, tc_ids))
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id") or ""
+            if tc_id:
+                # Find the most recent unmatched assistant with this tc_id
+                for i in range(len(pending_tool_calls) - 1, -1, -1):
+                    asst_idx, asst_ids = pending_tool_calls[i]
+                    if tc_id in asst_ids:
+                        tool_result_to_assistant_idx[msg_index] = asst_idx
+                        asst_ids.discard(tc_id)
+                        if not asst_ids:
+                            pending_tool_calls.pop(i)
+                        break
+
+    for msg_index, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -107,12 +158,20 @@ def openai_to_anthropic(body: dict):
                 system_parts.append(text)
             continue
 
-        blocks = anthropic_content_blocks(msg)
+        # For tool results, use the matched assistant msg_index so IDs match
+        effective_index = msg_index
+        if role == "tool" and msg_index in tool_result_to_assistant_idx:
+            effective_index = tool_result_to_assistant_idx[msg_index]
+
+        blocks = anthropic_content_blocks(msg, effective_index)
         if not blocks:
             continue
 
         converted_role = "user" if role in ("user", "tool") else "assistant"
-        if converted and converted[-1]["role"] == converted_role and role != "tool":
+        # Anthropic requires strict user/assistant alternation. Parallel OpenAI
+        # tool results arrive as consecutive role="tool" messages, so combine
+        # them into one user message containing multiple tool_result blocks.
+        if converted and converted[-1]["role"] == converted_role:
             converted[-1]["content"].extend(blocks)
         else:
             converted.append({"role": converted_role, "content": blocks})
@@ -141,7 +200,7 @@ def openai_to_anthropic(body: dict):
     return result
 
 
-def anthropic_content_blocks(msg: dict):
+def anthropic_content_blocks(msg: dict, msg_index: int = -1):
     role = msg.get("role")
     content = msg.get("content")
     blocks = []
@@ -149,7 +208,7 @@ def anthropic_content_blocks(msg: dict):
     if role == "tool":
         return [{
             "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id") or msg.get("id") or "tool_call",
+            "tool_use_id": _ensure_anthropic_tool_id(msg.get("tool_call_id") or msg.get("id") or "tool_call", msg_index),
             "content": content_to_text(content) or " ",
         }]
 
@@ -179,13 +238,18 @@ def anthropic_content_blocks(msg: dict):
                     blocks.append(part)
 
     if role == "assistant":
+        # Preserve reasoning_content for DeepSeek V4 Pro and other thinking models
+        reasoning = msg.get("reasoning_content")
+        if reasoning:
+            blocks.insert(0, {"type": "text", "text": f"[reasoning: {reasoning}]"})
+        
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
             function = tc.get("function") or {}
             blocks.append({
                 "type": "tool_use",
-                "id": tc.get("id") or f"call_{len(blocks)}",
+                "id": _ensure_anthropic_tool_id(tc.get("id") or f"call_{len(blocks)}", msg_index),
                 "name": function.get("name") or tc.get("name") or "tool",
                 "input": try_json(function.get("arguments")),
             })
