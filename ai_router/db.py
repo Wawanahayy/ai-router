@@ -167,7 +167,54 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('login_password', 'ABC12345'
 INSERT OR IGNORE INTO settings (key, value) VALUES ('require_api_key', 'true');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('rtk_enabled', 'true');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('rr_counter', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_url', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_enabled', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_type', 'socks5');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_host', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_port', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_username', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_password', '');
 """
+
+# --- Proxy cache (avoids DB read on every upstream request) ---
+_proxy_cache: str | None = None  # None = not loaded yet; "" = disabled
+_proxy_cache_ts: float = 0
+_PROXY_CACHE_TTL = 10.0  # seconds
+
+
+async def get_proxy_url() -> str | None:
+    """Return proxy URL from DB settings (cached). None if disabled or not set.
+    Builds URL from structured fields (type://user:pass@host:port) or falls back to raw proxy_url.
+    """
+    global _proxy_cache, _proxy_cache_ts
+    now = time.time()
+    if _proxy_cache is not None and (now - _proxy_cache_ts) < _PROXY_CACHE_TTL:
+        return _proxy_cache or None
+    enabled = await get_setting("proxy_enabled")
+    # Build from structured fields first
+    ptype = (await get_setting("proxy_type") or "socks5").strip()
+    host = (await get_setting("proxy_host") or "").strip()
+    port = (await get_setting("proxy_port") or "").strip()
+    username = (await get_setting("proxy_username") or "").strip()
+    password = (await get_setting("proxy_password") or "").strip()
+    if host and port:
+        auth = f"{username}:{password}@" if username else ""
+        url = f"{ptype}://{auth}{host}:{port}"
+        _proxy_cache = url
+    else:
+        # Fall back to raw proxy_url
+        raw = (await get_setting("proxy_url") or "").strip()
+        _proxy_cache = raw if raw else ""
+    if enabled != "true":
+        _proxy_cache = ""
+    _proxy_cache_ts = now
+    return _proxy_cache or None
+
+
+def invalidate_proxy_cache():
+    """Force next get_proxy_url() to re-read from DB."""
+    global _proxy_cache_ts
+    _proxy_cache_ts = 0
 
 # Provider presets - shown to user as templates when adding new providers
 PROVIDER_PRESETS = [
@@ -1320,11 +1367,18 @@ async def resolve_combo_candidates(combo_name: str):
     if not available:
         return []
     
-    # Select model based on combo mode (round_robin or single)
-    if combo.get("mode", "round_robin") == "single":
+    # Select model based on combo mode
+    mode = combo.get("mode", "round_robin")
+
+    if mode == "single":
+        # Single mode: only the first available model, no fallback on error
+        return available[:1]
+
+    if mode == "fallback":
+        # Fallback mode: fixed order, proxy tries each in order on error
         return available
 
-    # Round-robin mode: rotate fallback order through available models.
+    # Round-robin mode: rotate starting index each request
     rr = await _get_rr(f"combo_rr_{combo_id}")
     start = rr % len(available)
     ordered = available[start:] + available[:start]

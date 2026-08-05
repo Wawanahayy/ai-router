@@ -22,6 +22,20 @@ UPSTREAM_READ_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_READ_TIMEOUT", "300"
 UPSTREAM_WRITE_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_WRITE_TIMEOUT", "20"))
 UPSTREAM_POOL_TIMEOUT = float(os.getenv("AI_ROUTER_UPSTREAM_POOL_TIMEOUT", "20"))
 STRICT_CONTEXT_FILTER = os.getenv("AI_ROUTER_STRICT_CONTEXT_FILTER", "false").lower() in ("1", "true", "yes", "on")
+
+# Proxy support — env var fallback (AI_ROUTER_PROXY) when DB settings not configured
+UPSTREAM_PROXY_URL = os.getenv("AI_ROUTER_PROXY", "").strip()
+
+
+async def _proxy_kwargs() -> dict:
+    """Return proxy kwarg for httpx.AsyncClient if configured.
+    Priority: DB settings (proxy_enabled + proxy_url) > env var AI_ROUTER_PROXY.
+    """
+    db_proxy = await db.get_proxy_url()
+    proxy_url = db_proxy or UPSTREAM_PROXY_URL or None
+    if proxy_url:
+        return {"proxy": proxy_url}
+    return {}
 RESPONSES_SESSION_TTL = float(os.getenv("AI_ROUTER_RESPONSES_SESSION_TTL", "3600"))
 RESPONSES_SESSION_MAX_MESSAGES = int(os.getenv("AI_ROUTER_RESPONSES_SESSION_MAX_MESSAGES", "120"))
 TOOL_MIN_OUTPUT_TOKENS = int(os.getenv("AI_ROUTER_TOOL_MIN_OUTPUT_TOKENS", "32768"))
@@ -1214,7 +1228,8 @@ async def proxy_anthropic_messages(request_body: dict, headers: dict, local_key_
     last_status = 502
     fallback_chain = []
 
-    async with httpx.AsyncClient(timeout=_upstream_timeout()) as client:
+    _pk = await _proxy_kwargs()
+    async with httpx.AsyncClient(timeout=_upstream_timeout(), **_pk) as client:
         for attempt in attempts:
             provider_id = attempt["provider_id"]
             actual_model = attempt["model"]
@@ -1411,7 +1426,8 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
     last_error = "No upstream attempts were made"
     last_status = 502
 
-    async with httpx.AsyncClient(timeout=_upstream_timeout()) as client:
+    _pk = await _proxy_kwargs()
+    async with httpx.AsyncClient(timeout=_upstream_timeout(), **_pk) as client:
         for attempt in attempts:
             provider_id = attempt["provider_id"]
             actual_model = attempt["model"]
@@ -1511,6 +1527,16 @@ async def _proxy_with_fallback(request_body: dict, attempts: list, local_key_id:
                     await db.mark_local_key_used(local_key_id, total_tokens)
                 success_chain = fallback_chain if fallback_chain else None
                 await db.add_log(provider_id, key["id"], actual_model, tokens_in, tokens_out, latency, resp.status_code, local_key_id=local_key_id, fallback_chain=success_chain)
+                if fallback_chain:
+                    prev = fallback_chain[-1]
+                    logger.info(
+                        "Combo fallback detected: %s/%s -> %s/%s (model=%s, prev_status=%s %s, latency=%sms)",
+                        prev.get("provider"), prev.get("key_label"),
+                        provider.get("name"), key.get("label"),
+                        actual_model,
+                        prev.get("status_code"), prev.get("error_kind"),
+                        latency,
+                    )
                 client_response = translator.normalize_chat_response(response_data, provider, actual_model, request_body)
                 _log_response_shape("client_response", provider, client_response, actual_model, resp.status_code)
                 response_tool_stats = translator.response_tool_stats(client_response)
@@ -1734,7 +1760,8 @@ async def _proxy_anthropic_native_stream(prepared: dict, provider: dict, key: di
         stream_opened = False
         finalized = False
         try:
-            async with httpx.AsyncClient(timeout=stream_timeout) as client:
+            _pk = await _proxy_kwargs()
+            async with httpx.AsyncClient(timeout=stream_timeout, **_pk) as client:
                 async with client.stream("POST", auth["url"], headers=headers, json=prepared["body"]) as resp:
                     if resp.status_code >= 400:
                         error_text = await resp.aread()

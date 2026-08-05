@@ -331,6 +331,10 @@ button {
   background: rgba(217,119,6,0.76);
 }
 
+.mode-switch button.fallback.is-active {
+  background: rgba(5,150,105,0.76);
+}
+
 .inline-confirm {
   display: inline-flex;
   align-items: center;

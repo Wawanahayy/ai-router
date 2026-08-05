@@ -592,6 +592,7 @@ async def api_set_settings(request: Request):
     data = await request.json()
     for k, v in data.items():
         await db.set_setting(k, str(v))
+    db.invalidate_proxy_cache()
     return {"ok": True}
 
 

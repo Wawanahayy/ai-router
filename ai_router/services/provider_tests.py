@@ -1,6 +1,7 @@
 """Provider connectivity and agent-tool tests."""
 import json
 import logging
+import os
 import time
 
 import httpx
@@ -40,11 +41,11 @@ async def test_provider(provider_id: str):
         if provider_format(provider) == "anthropic-compatible":
             req = build_request(provider, "chat", key["key_value"])
             body = {"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, proxy=await db.get_proxy_url()) as client:
                 resp = await client.post(req["url"], headers=req["headers"], json=body)
         else:
             req = build_request(provider, "models", key["key_value"])
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, proxy=await db.get_proxy_url()) as client:
                 resp = await client.get(req["url"], headers=req["headers"])
 
         latency = int((time.time() - start) * 1000)
@@ -104,7 +105,7 @@ async def test_provider_tools(provider_id: str, model_id: str = None):
 
     start = time.time()
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=45.0, proxy=await db.get_proxy_url()) as client:
             resp = await client.post(req["url"], headers=req["headers"], json=payload)
         latency = int((time.time() - start) * 1000)
         text = resp.text

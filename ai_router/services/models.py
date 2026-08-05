@@ -117,7 +117,7 @@ async def _fetch_models_from_upstream(provider: dict, key: dict, timeout: float 
         requests.append(("bearer-fallback", build_request(bearer_provider, "models", key["key_value"])))
 
     last_response = None
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, proxy=await db.get_proxy_url()) as client:
         for auth_mode, req in requests:
             try:
                 resp = await client.get(req["url"], headers=req["headers"])

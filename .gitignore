@@ -39,3 +39,16 @@ apikey.*
 apikey_*.*
 apikey-*.*
 apikey*.*
+
+# Backups
+*.bak
+*.bak.*
+
+# Swap daemon state (local-only)
+swap_daemon.lock
+swap_daemon.log
+disabled_generators.txt
+
+# Tor scripts (local-only)
+tor-rotate.sh
+tor-stable-rotate.sh

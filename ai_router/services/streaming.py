@@ -32,6 +32,90 @@ def _rate_limit_wait_seconds(attempt_count: int):
     return steps[min(max(attempt_count - 1, 0), len(steps) - 1)]
 
 
+def _trim_tool_context(body: dict | None, keep_last: int = 10) -> dict | None:
+    """Trim old tool call/result message pairs, keeping the last N pairs.
+
+    Returns a new body dict with trimmed messages, or None if no trimming
+    was possible (too few tool messages or invalid body).
+
+    Preserves: system prompt, first user message, last N tool-related
+    message groups (assistant+tool_calls followed by tool results), and
+    all non-tool messages in between.
+    """
+    if not isinstance(body, dict):
+        return None
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 5:
+        return None
+
+    from copy import deepcopy
+
+    # Identify tool-related message indices (assistant with tool_calls + tool results)
+    tool_groups = []  # list of (start_idx, end_idx) for each tool call group
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict):
+            i += 1
+            continue
+        # Detect assistant message with tool_calls
+        is_tool_assistant = (
+            msg.get("role") == "assistant"
+            and (msg.get("tool_calls") or msg.get("function_call"))
+        )
+        if is_tool_assistant:
+            group_start = i
+            group_end = i
+            # Collect following tool result messages
+            j = i + 1
+            while j < len(messages):
+                next_msg = messages[j]
+                if isinstance(next_msg, dict) and next_msg.get("role") == "tool":
+                    group_end = j
+                    j += 1
+                else:
+                    break
+            tool_groups.append((group_start, group_end))
+            i = group_end + 1
+        else:
+            i += 1
+
+    # Only trim if there are more than keep_last tool groups
+    if len(tool_groups) <= keep_last:
+        return None
+
+    # Groups to remove (all except last keep_last)
+    groups_to_remove = tool_groups[:-keep_last]
+    remove_indices = set()
+    for start, end in groups_to_remove:
+        for idx in range(start, end + 1):
+            remove_indices.add(idx)
+
+    # Build trimmed messages
+    new_body = deepcopy(body)
+    trimmed_messages = []
+    removed_count = 0
+    for idx, msg in enumerate(messages):
+        if idx in remove_indices:
+            removed_count += 1
+        else:
+            trimmed_messages.append(msg)
+
+    # Insert a summary note after the system/first messages so model knows context was trimmed
+    insert_pos = min(2, len(trimmed_messages))
+    trimmed_messages.insert(insert_pos, {
+        "role": "user",
+        "content": (
+            f"[CONTEXT TRIMMED: {removed_count} older tool call/result messages were removed "
+            f"to fit context window. {keep_last} most recent tool interactions are preserved below. "
+            f"Continue from where you left off.]"
+        ),
+    })
+
+    new_body["messages"] = trimmed_messages
+    return new_body
+
+
 def _estimate_input_tokens(body: dict) -> int:
     try:
         return max(0, int((len(json.dumps(body or {}, ensure_ascii=False)) + 3) / 4))
@@ -611,7 +695,7 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
         }]
         last_error = None
 
-        async with httpx.AsyncClient(timeout=stream_timeout) as client:
+        async with httpx.AsyncClient(timeout=stream_timeout, proxy=await db.get_proxy_url()) as client:
             for index, attempt in enumerate(attempts):
                 sent_done = False
                 emitted = False
@@ -822,6 +906,50 @@ async def proxy_stream(url, headers, body, provider_id, key_id, model, start_tim
                                 if STREAM_TRANSIENT_WAIT > 0:
                                     await asyncio.sleep(STREAM_TRANSIENT_WAIT)
                                 continue
+
+                            # ── Context trim retry: keep last 10 tool pairs ──
+                            # If no more attempts AND context has many tool calls,
+                            # trim old tool call/result pairs (keep last 10) and
+                            # retry once with the same key. This handles the case
+                            # where upstream silently returns empty due to context
+                            # overflow without an explicit error code.
+                            if not attempt.get("_context_trimmed"):
+                                trimmed_body = _trim_tool_context(attempt.get("body"), keep_last=10)
+                                if trimmed_body is not None:
+                                    attempt["body"] = trimmed_body
+                                    attempt["_context_trimmed"] = True
+                                    logger.info(
+                                        "Context trimmed (keep last 10 tool pairs) — retrying provider=%s model=%s",
+                                        attempt.get("provider_name") or attempt.get("provider_id"),
+                                        attempt["model"],
+                                    )
+                                    # Reset state for retry
+                                    sent_done = False
+                                    emitted = False
+                                    received_raw = False
+                                    opened_success = False
+                                    finalized_success = False
+                                    buffer = ""
+                                    content_state["content"] = False
+                                    content_state["tools"] = False
+                                    content_state["text_buffer"] = ""
+                                    content_state["reasoning_buffer"] = ""
+                                    tool_state["calls"] = {}
+                                    openai_tool_state["calls"] = {}
+                                    openai_text_state["buffer"] = ""
+                                    current_start = time.time()
+                                    defer_output = request_has_tool_results(attempt.get("body"))
+                                    deferred_outputs = []
+                                    if STREAM_TRANSIENT_WAIT > 0:
+                                        await asyncio.sleep(STREAM_TRANSIENT_WAIT)
+                                    # Re-run this attempt by manipulating index
+                                    # We can't easily re-enter the for loop, so we
+                                    # break and let the outer code yield error.
+                                    # Instead, use a goto-like pattern: append trimmed
+                                    # attempt to attempts list and continue.
+                                    attempts.append(attempt)
+                                    continue
+
                             yield error_chunk("upstream failed to produce an executable response after retries")
                             return
 

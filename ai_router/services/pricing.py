@@ -1,4 +1,7 @@
 import httpx
+import os
+
+from .. import db
 
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -6,7 +9,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 async def fetch_openrouter_pricing():
     headers = {"User-Agent": "ai-router/1.0"}
-    async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=30.0, headers=headers, proxy=await db.get_proxy_url()) as client:
         resp = await client.get(OPENROUTER_MODELS_URL)
         resp.raise_for_status()
         models = resp.json().get("data") or []

@@ -165,22 +165,29 @@ export default function Combos() {
 									</div>
 								</div>
 								<div className="flex items-center gap-2">
-									<div className="mode-switch" aria-label="Combo routing mode">
-										<button
-											type="button"
-											onClick={() => setComboMode(combo.id, 'round_robin', combo.mode)}
-											className={combo.mode !== 'single' ? 'is-active' : ''}
-										>
-											Round-Robin
-										</button>
-										<button
-											type="button"
-											onClick={() => setComboMode(combo.id, 'single', combo.mode)}
-											className={`single ${combo.mode === 'single' ? 'is-active' : ''}`}
-										>
-											Single
-										</button>
-									</div>
+				<div className="mode-switch" aria-label="Combo routing mode">
+						<button
+							type="button"
+							onClick={() => setComboMode(combo.id, 'single', combo.mode)}
+							className={`single ${combo.mode === 'single' ? 'is-active' : ''}`}
+						>
+							Single
+						</button>
+						<button
+							type="button"
+							onClick={() => setComboMode(combo.id, 'round_robin', combo.mode)}
+							className={combo.mode === 'round_robin' || (!combo.mode) ? 'is-active' : ''}
+						>
+							Robin
+						</button>
+						<button
+							type="button"
+							onClick={() => setComboMode(combo.id, 'fallback', combo.mode)}
+							className={`fallback ${combo.mode === 'fallback' ? 'is-active' : ''}`}
+						>
+							Fallback
+						</button>
+					</div>
 									<div className="flex items-center gap-2 text-xs text-slate-400">
 										<ToggleSwitch
 											checked={combo.is_active !== 0}
